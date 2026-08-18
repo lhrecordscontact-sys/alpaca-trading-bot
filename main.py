@@ -30,7 +30,6 @@ HEADERS = {
 # BOT SETTINGS
 # ============================================================
 
-# Starting strategy watchlist
 WATCHLIST = [
     "SPY",
     "IWM",
@@ -47,20 +46,15 @@ WATCHLIST = [
     "ARM",
 ]
 
-# Scanner filters
 MIN_PRICE = 5.00
 MIN_DAILY_VOLUME = 1_000_000
-
-# Require a stock to score at least this high
 MIN_SCANNER_SCORE = 70
 
-# Risk controls
 MAX_RISK_PER_TRADE = 60.00
 MAX_DAILY_LOSS = 180.00
 MAX_OPEN_POSITIONS = 3
 
-# Important:
-# AUTO_TRADE stays False while we test.
+# Keep False until paper testing is complete
 AUTO_TRADE = False
 
 
@@ -136,7 +130,6 @@ def get_snapshot(symbol):
             f"/v2/stocks/{symbol}/snapshot",
             params={"feed": "iex"},
         )
-
         return data
 
     except Exception as e:
@@ -152,10 +145,9 @@ def analyze_symbol(symbol):
     """
     Scores a stock from 0-100.
 
-    This is NOT claiming a 90% win rate.
-
-    The score simply determines whether the stock currently
-    matches the conditions we want before allowing a signal.
+    This does NOT claim a 90% win rate.
+    The score determines whether the stock currently matches
+    the scanner conditions.
     """
 
     snapshot = get_snapshot(symbol)
@@ -169,8 +161,8 @@ def analyze_symbol(symbol):
     previous_bar = snapshot.get("prevDailyBar") or {}
 
     price = latest_trade.get("p") or minute_bar.get("c")
-    volume = daily_bar.get("v", 0)
 
+    volume = daily_bar.get("v", 0)
     current_open = daily_bar.get("o")
     current_high = daily_bar.get("h")
     current_low = daily_bar.get("l")
@@ -184,43 +176,31 @@ def analyze_symbol(symbol):
     score = 0
     reasons = []
 
-    # --------------------------------------------------------
     # PRICE FILTER
-    # --------------------------------------------------------
-
     if price >= MIN_PRICE:
         score += 10
         reasons.append("price filter passed")
 
-    # --------------------------------------------------------
     # LIQUIDITY FILTER
-    # --------------------------------------------------------
-
     if volume >= MIN_DAILY_VOLUME:
         score += 20
         reasons.append("high liquidity")
 
-    # --------------------------------------------------------
     # RELATIVE VOLUME
-    # --------------------------------------------------------
-
     relative_volume = 0
 
     if previous_volume and previous_volume > 0:
         relative_volume = volume / previous_volume
 
-        if relative_volume >= 1.0:
-            score += 20
-            reasons.append("strong relative volume")
+    if relative_volume >= 1.0:
+        score += 20
+        reasons.append("strong relative volume")
 
-        elif relative_volume >= 0.50:
-            score += 10
-            reasons.append("moderate relative volume")
+    elif relative_volume >= 0.50:
+        score += 10
+        reasons.append("moderate relative volume")
 
-    # --------------------------------------------------------
     # DAILY MOMENTUM
-    # --------------------------------------------------------
-
     percent_change = 0
 
     if previous_close and previous_close > 0:
@@ -228,22 +208,18 @@ def analyze_symbol(symbol):
             (price - previous_close) / previous_close
         ) * 100
 
-        if abs(percent_change) >= 2:
-            score += 20
-            reasons.append("strong price movement")
+    if abs(percent_change) >= 2:
+        score += 20
+        reasons.append("strong price movement")
 
-        elif abs(percent_change) >= 1:
-            score += 10
-            reasons.append("moderate price movement")
+    elif abs(percent_change) >= 1:
+        score += 10
+        reasons.append("moderate price movement")
 
-    # --------------------------------------------------------
     # CURRENT SESSION DIRECTION
-    # --------------------------------------------------------
-
     direction = "neutral"
 
     if current_open:
-
         if price > current_open:
             direction = "bullish"
             score += 10
@@ -254,10 +230,7 @@ def analyze_symbol(symbol):
             score += 10
             reasons.append("trading below daily open")
 
-    # --------------------------------------------------------
     # LOCATION WITHIN DAILY RANGE
-    # --------------------------------------------------------
-
     range_position = None
 
     if (
@@ -265,7 +238,6 @@ def analyze_symbol(symbol):
         and current_low is not None
         and current_high > current_low
     ):
-
         range_position = (
             (price - current_low)
             / (current_high - current_low)
@@ -279,8 +251,8 @@ def analyze_symbol(symbol):
             score += 20
             reasons.append("near session lows")
 
-        else:
-            score += 5
+    else:
+        score += 5
 
     passed = score >= MIN_SCANNER_SCORE
 
@@ -306,7 +278,6 @@ def scan_watchlist():
     results = []
 
     for symbol in WATCHLIST:
-
         result = analyze_symbol(symbol)
 
         if result:
@@ -339,7 +310,6 @@ def risk_checks(symbol):
         return False, "Maximum open positions reached."
 
     for position in positions:
-
         if position.get("symbol") == symbol:
             return False, f"Already have an open {symbol} position."
 
@@ -353,9 +323,7 @@ def risk_checks(symbol):
 def submit_stock_order(symbol, side, qty):
     """
     PAPER STOCK ORDER ONLY.
-
-    Options automation will be added separately after
-    paper testing the scanner and signals.
+    Options automation can be added separately after paper testing.
     """
 
     payload = {
@@ -380,7 +348,6 @@ def submit_stock_order(symbol, side, qty):
 
 @app.route("/", methods=["GET"])
 def home():
-
     return jsonify({
         "status": "online",
         "bot": "Purgatory AI Scanner",
@@ -400,11 +367,9 @@ def home():
 
 @app.route("/account", methods=["GET"])
 def account():
-
     data = get_account()
 
     if not data:
-
         return jsonify({
             "success": False,
             "error": "Unable to retrieve Alpaca account.",
@@ -426,7 +391,6 @@ def account():
 
 @app.route("/positions", methods=["GET"])
 def positions():
-
     return jsonify({
         "success": True,
         "positions": get_positions(),
@@ -439,9 +403,7 @@ def positions():
 
 @app.route("/scan", methods=["GET"])
 def scan():
-
     try:
-
         results = scan_watchlist()
 
         qualified = [
@@ -462,7 +424,6 @@ def scan():
         })
 
     except Exception as e:
-
         return jsonify({
             "success": False,
             "error": str(e),
@@ -475,13 +436,11 @@ def scan():
 
 @app.route("/analyze/<symbol>", methods=["GET"])
 def analyze(symbol):
-
     symbol = symbol.upper().strip()
 
     result = analyze_symbol(symbol)
 
     if not result:
-
         return jsonify({
             "success": False,
             "error": f"Unable to analyze {symbol}",
@@ -499,22 +458,15 @@ def analyze(symbol):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-
     try:
-
         data = request.get_json(
             force=True,
             silent=False,
         )
 
-        # ----------------------------------------------------
         # SECURITY
-        # ----------------------------------------------------
-
         if WEBHOOK_SECRET:
-
             if data.get("secret") != WEBHOOK_SECRET:
-
                 return jsonify({
                     "success": False,
                     "error": "Invalid webhook secret.",
@@ -528,91 +480,77 @@ def webhook():
             data.get("side", "")
         ).lower().strip()
 
-        qty = int(
-            data.get("qty", 1)
-        )
-
         signal = str(
             data.get("signal", "")
         ).upper().strip()
 
-        if not symbol:
+        try:
+            qty = int(data.get("qty", 1))
+        except (TypeError, ValueError):
+            return jsonify({
+                "success": False,
+                "error": "qty must be a whole number.",
+            }), 400
 
+        if not symbol:
             return jsonify({
                 "success": False,
                 "error": "Missing symbol.",
             }), 400
 
         if side not in ["buy", "sell"]:
-
             return jsonify({
                 "success": False,
                 "error": "Side must be buy or sell.",
             }), 400
 
-        # ----------------------------------------------------
-        # RUN SCANNER BEFORE ANY ENTRY
-        # ----------------------------------------------------
+        if qty <= 0:
+            return jsonify({
+                "success": False,
+                "error": "qty must be greater than 0.",
+            }), 400
 
+        # RUN SCANNER BEFORE ENTRY
         scan_result = analyze_symbol(symbol)
 
         if not scan_result:
-
             return jsonify({
                 "success": False,
                 "trade_allowed": False,
                 "error": "Scanner could not analyze symbol.",
             }), 400
 
-        # ----------------------------------------------------
         # STOCK MUST PASS SCANNER
-        # ----------------------------------------------------
-
         if not scan_result["passed"]:
-
             return jsonify({
                 "success": True,
                 "trade_allowed": False,
-                "message": (
-                    f"{symbol} signal rejected by scanner."
-                ),
+                "message": f"{symbol} signal rejected by scanner.",
                 "scanner": scan_result,
             })
 
-        # ----------------------------------------------------
         # DIRECTION CHECK
-        # ----------------------------------------------------
-
         expected_direction = (
             "bullish"
             if side == "buy"
             else "bearish"
         )
 
-        if (
-            scan_result["direction"]
-            != expected_direction
-        ):
-
+        if scan_result["direction"] != expected_direction:
             return jsonify({
                 "success": True,
                 "trade_allowed": False,
                 "message": (
                     f"{symbol} rejected because scanner "
-                    f"direction is "
-                    f"{scan_result['direction']}."
+                    f"direction is {scan_result['direction']}."
                 ),
                 "scanner": scan_result,
             })
 
-        # ----------------------------------------------------
         # ACCOUNT RISK CHECK
-        # ----------------------------------------------------
-
         allowed, reason = risk_checks(symbol)
 
         if not allowed:
-
             return jsonify({
                 "success": True,
                 "trade_allowed": False,
@@ -620,21 +558,16 @@ def webhook():
                 "scanner": scan_result,
             })
 
-        # ----------------------------------------------------
         # TEST MODE
-        # ----------------------------------------------------
-
         if not AUTO_TRADE:
-
             return jsonify({
                 "success": True,
                 "trade_allowed": True,
                 "order_sent": False,
                 "mode": "PAPER TEST",
                 "message": (
-                    f"{symbol} passed scanner and "
-                    f"risk checks. Order NOT sent because "
-                    f"AUTO_TRADE is disabled."
+                    f"{symbol} passed scanner and risk checks. "
+                    f"Order NOT sent because AUTO_TRADE is disabled."
                 ),
                 "signal": signal,
                 "side": side,
@@ -642,10 +575,7 @@ def webhook():
                 "scanner": scan_result,
             })
 
-        # ----------------------------------------------------
         # PAPER ORDER
-        # ----------------------------------------------------
-
         status, order = submit_stock_order(
             symbol,
             side,
@@ -653,7 +583,6 @@ def webhook():
         )
 
         if status >= 400:
-
             return jsonify({
                 "success": False,
                 "trade_allowed": True,
@@ -674,7 +603,6 @@ def webhook():
         })
 
     except Exception as e:
-
         return jsonify({
             "success": False,
             "error": str(e),
@@ -686,7 +614,6 @@ def webhook():
 # ============================================================
 
 if __name__ == "__main__":
-
     port = int(
         os.environ.get(
             "PORT",
