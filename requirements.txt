@@ -1,6 +1,2 @@
+flask
 alpaca-py
-pandas
-numpy
-python-dotenv
-requests
-gunicorn
