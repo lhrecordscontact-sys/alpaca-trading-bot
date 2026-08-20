@@ -1,29 +1,33 @@
 import os
+import time
 import math
+import threading
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 
 import requests
-from flask import Flask, request, jsonify
+import pandas as pd
+from flask import Flask, jsonify
 
 
 # ============================================================
-# APP
+# APP / LOGGING
 # ============================================================
 
 app = Flask(__name__)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 NY = ZoneInfo("America/New_York")
+UTC = ZoneInfo("UTC")
 
 
 # ============================================================
-# CONFIG
+# ALPACA CONFIG
 # ============================================================
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
@@ -32,6 +36,8 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
 TRADING_BASE_URL = "https://paper-api.alpaca.markets"
 DATA_BASE_URL = "https://data.alpaca.markets"
 
+DATA_FEED = os.getenv("DATA_FEED", "iex").strip().lower()
+
 AUTO_TRADE = (
     os.getenv("AUTO_TRADE", "false")
     .strip()
@@ -39,9 +45,85 @@ AUTO_TRADE = (
     == "true"
 )
 
-MIN_WIN_RATE = float(
-    os.getenv("MIN_WIN_RATE", "90")
+RUN_BOT_LOOP = (
+    os.getenv("RUN_BOT_LOOP", "true")
+    .strip()
+    .lower()
+    == "true"
 )
+
+
+# ============================================================
+# STRATEGY SETTINGS
+# ============================================================
+
+TIMEFRAME_MINUTES = 4
+
+EMA_FAST = 5
+EMA_SLOW = 9
+EMA_TREND = 30
+
+MIN_OVERALL_WIN_RATE = float(
+    os.getenv("MIN_OVERALL_WIN_RATE", "90")
+)
+
+MIN_COMPLETED_TRADES = int(
+    os.getenv("MIN_COMPLETED_TRADES", "20")
+)
+
+MAX_TRADES_PER_DAY = int(
+    os.getenv("MAX_TRADES_PER_DAY", "2")
+)
+
+SPY_TARGET = float(
+    os.getenv("SPY_TARGET", "1.00")
+)
+
+IWM_TARGET = float(
+    os.getenv("IWM_TARGET", "0.50")
+)
+
+DEFAULT_TARGET = float(
+    os.getenv("DEFAULT_TARGET", "1.00")
+)
+
+
+# ============================================================
+# MORNING SCANNER SETTINGS
+# ============================================================
+
+# Build list at 8:45 AM ET
+SCAN_HOUR = int(
+    os.getenv("SCAN_HOUR", "8")
+)
+
+SCAN_MINUTE = int(
+    os.getenv("SCAN_MINUTE", "45")
+)
+
+# Alpaca supports up to 100 most-active names.
+MOST_ACTIVE_TOP = int(
+    os.getenv("MOST_ACTIVE_TOP", "100")
+)
+
+# Number of names we'll actually backtest.
+# Lower this if Render becomes slow.
+MAX_SCAN_CANDIDATES = int(
+    os.getenv("MAX_SCAN_CANDIDATES", "50")
+)
+
+BACKTEST_DAYS = int(
+    os.getenv("BACKTEST_DAYS", "45")
+)
+
+SCAN_PAUSE_SECONDS = float(
+    os.getenv("SCAN_PAUSE_SECONDS", "0.35")
+)
+
+
+# ============================================================
+# EXECUTION SETTINGS
+# ============================================================
 
 POSITION_DOLLARS = float(
     os.getenv("POSITION_DOLLARS", "500")
@@ -51,12 +133,50 @@ MAX_OPEN_POSITIONS = int(
     os.getenv("MAX_OPEN_POSITIONS", "3")
 )
 
-LAST_ENTRY_HOUR = 14
-LAST_ENTRY_MINUTE = 45
+MAX_NEW_TRADES_PER_CYCLE = int(
+    os.getenv("MAX_NEW_TRADES_PER_CYCLE", "1")
+)
+
+LOOP_SECONDS = int(
+    os.getenv("LOOP_SECONDS", "20")
+)
+
+LAST_ENTRY_TIME = dt_time(14, 45)
+FORCE_EXIT_TIME = dt_time(15, 15)
+
+PM_START = dt_time(4, 0)
+PM_END = dt_time(9, 30)
+
+RTH_START = dt_time(9, 30)
+RTH_END = dt_time(16, 0)
 
 
 # ============================================================
-# ALPACA HEADERS
+# BOT STATE
+# ============================================================
+
+state_lock = threading.Lock()
+
+BOT_STATE = {
+    "status": "starting",
+    "scan_date": None,
+    "scan_started": None,
+    "scan_finished": None,
+    "daily_watchlist": [],
+    "qualified_details": {},
+    "current_signals": {},
+    "last_cycle": None,
+    "last_error": None,
+    "orders": [],
+}
+
+last_signal_bar = {}
+
+active_trades = {}
+
+
+# ============================================================
+# API HELPERS
 # ============================================================
 
 def alpaca_headers():
@@ -67,195 +187,125 @@ def alpaca_headers():
     }
 
 
-# ============================================================
-# BASIC API REQUEST
-# ============================================================
-
-def alpaca_request(
+def api_request(
     method,
-    endpoint,
+    path,
+    base=TRADING_BASE_URL,
     params=None,
-    json=None,
-    base_url=None
+    payload=None,
+    timeout=30,
 ):
-    if base_url is None:
-        base_url = TRADING_BASE_URL
+    url = f"{base}{path}"
 
-    url = f"{base_url}{endpoint}"
-
-    response = requests.request(
-        method=method,
-        url=url,
+    r = requests.request(
+        method,
+        url,
         headers=alpaca_headers(),
         params=params,
-        json=json,
-        timeout=20,
+        json=payload,
+        timeout=timeout,
     )
 
-    if not response.ok:
-        logging.error(
-            "ALPACA ERROR %s %s",
-            response.status_code,
-            response.text
-        )
-
+    if not r.ok:
         raise RuntimeError(
-            f"Alpaca {response.status_code}: "
-            f"{response.text}"
+            f"{method} {path} -> "
+            f"{r.status_code}: {r.text}"
         )
 
-    if response.text:
-        return response.json()
+    if not r.text:
+        return {}
 
-    return {}
+    return r.json()
 
 
 # ============================================================
-# ACCOUNT CHECK
+# ACCOUNT / CLOCK
 # ============================================================
 
 def get_account():
-    return alpaca_request(
+    return api_request(
         "GET",
-        "/v2/account"
+        "/v2/account",
     )
 
 
-# ============================================================
-# POSITIONS
-# ============================================================
+def get_clock():
+    return api_request(
+        "GET",
+        "/v2/clock",
+    )
 
-def get_positions():
+
+def market_is_open():
     try:
-        return alpaca_request(
-            "GET",
-            "/v2/positions"
+        return bool(
+            get_clock().get("is_open", False)
         )
-
-    except Exception as exc:
-        logging.error(
-            "Could not load positions: %s",
-            exc
-        )
-
-        return []
-
-
-def has_underlying_position(
-    underlying
-):
-    underlying = underlying.upper()
-
-    positions = get_positions()
-
-    for position in positions:
-
-        symbol = str(
-            position.get(
-                "symbol",
-                ""
-            )
-        ).upper()
-
-        asset_class = str(
-            position.get(
-                "asset_class",
-                ""
-            )
-        ).lower()
-
-        # Equity position
-        if symbol == underlying:
-            return True
-
-        # OCC option symbols normally begin with underlying
-        if (
-            asset_class == "us_option"
-            and symbol.startswith(underlying)
-        ):
-            return True
-
-    return False
-
-
-def open_position_count():
-    return len(
-        get_positions()
-    )
-
-
-# ============================================================
-# MARKET HOURS ENTRY FILTER
-# ============================================================
-
-def entry_time_allowed():
-    now = datetime.now(NY)
-
-    # Monday-Friday
-    if now.weekday() >= 5:
+    except Exception:
         return False
 
-    current_minutes = (
-        now.hour * 60
-        + now.minute
+
+# ============================================================
+# MOST ACTIVE STOCK DISCOVERY
+# ============================================================
+
+def get_most_active_stocks():
+
+    result = api_request(
+        "GET",
+        "/v1beta1/screener/stocks/most-actives",
+        base=DATA_BASE_URL,
+        params={
+            "by": "volume",
+            "top": MOST_ACTIVE_TOP,
+        },
     )
 
-    market_open = (
-        9 * 60
-        + 30
+    rows = result.get(
+        "most_actives",
+        result.get("mostActives", [])
     )
 
-    last_entry = (
-        LAST_ENTRY_HOUR * 60
-        + LAST_ENTRY_MINUTE
-    )
+    symbols = []
 
-    return (
-        market_open
-        <= current_minutes
-        <= last_entry
-    )
+    for row in rows:
+
+        symbol = str(
+            row.get("symbol", "")
+        ).upper().strip()
+
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+
+    return symbols
 
 
 # ============================================================
-# TODAY EXPIRATION
+# 0DTE AVAILABILITY
 # ============================================================
 
 def today_et():
-    return (
-        datetime
-        .now(NY)
-        .date()
-        .isoformat()
-    )
+    return datetime.now(NY).date().isoformat()
 
 
-# ============================================================
-# FIND 0DTE OPTION CONTRACTS
-# ============================================================
-
-def get_0dte_contracts(
+def get_option_contracts(
     underlying,
-    option_type
+    option_type=None,
 ):
-    option_type = (
-        "call"
-        if option_type.upper() == "CALL"
-        else "put"
-    )
-
     params = {
         "underlying_symbols": underlying,
         "expiration_date": today_et(),
-        "type": option_type,
         "status": "active",
         "limit": 1000,
     }
 
-    result = alpaca_request(
+    if option_type:
+        params["type"] = option_type
+
+    result = api_request(
         "GET",
         "/v2/options/contracts",
-        params=params
+        params=params,
     )
 
     return result.get(
@@ -264,141 +314,1265 @@ def get_0dte_contracts(
     )
 
 
+def has_0dte_options(symbol):
+
+    try:
+        contracts = get_option_contracts(symbol)
+
+        return len(contracts) > 0
+
+    except Exception as exc:
+        logging.warning(
+            "%s option check failed: %s",
+            symbol,
+            exc,
+        )
+
+        return False
+
+
 # ============================================================
-# FIND ATM CONTRACT
+# HISTORICAL BARS
+# ============================================================
+
+def fetch_bars(
+    symbol,
+    days,
+):
+
+    end = datetime.now(UTC)
+
+    start = (
+        end
+        - timedelta(days=days)
+    )
+
+    params = {
+        "timeframe": "4Min",
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "limit": 10000,
+        "adjustment": "raw",
+        "feed": DATA_FEED,
+        "sort": "asc",
+    }
+
+    result = api_request(
+        "GET",
+        f"/v2/stocks/{symbol}/bars",
+        base=DATA_BASE_URL,
+        params=params,
+    )
+
+    bars = result.get(
+        "bars",
+        []
+    )
+
+    token = result.get(
+        "next_page_token"
+    )
+
+    while token:
+
+        params["page_token"] = token
+
+        page = api_request(
+            "GET",
+            f"/v2/stocks/{symbol}/bars",
+            base=DATA_BASE_URL,
+            params=params,
+        )
+
+        bars.extend(
+            page.get("bars", [])
+        )
+
+        token = page.get(
+            "next_page_token"
+        )
+
+    if not bars:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(bars)
+
+    df = df.rename(
+        columns={
+            "t": "timestamp",
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume",
+        }
+    )
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        utc=True,
+    )
+
+    df = df.set_index(
+        "timestamp"
+    )
+
+    df = df.tz_convert(NY)
+
+    for col in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]:
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce",
+        )
+
+    df = df.dropna(
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+    )
+
+    return df
+
+
+# ============================================================
+# INDICATORS
+# ============================================================
+
+def add_indicators(df):
+
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    df["ema5"] = (
+        df["close"]
+        .ewm(
+            span=EMA_FAST,
+            adjust=False,
+        )
+        .mean()
+    )
+
+    df["ema9"] = (
+        df["close"]
+        .ewm(
+            span=EMA_SLOW,
+            adjust=False,
+        )
+        .mean()
+    )
+
+    df["ema30"] = (
+        df["close"]
+        .ewm(
+            span=EMA_TREND,
+            adjust=False,
+        )
+        .mean()
+    )
+
+    typical = (
+        df["high"]
+        + df["low"]
+        + df["close"]
+    ) / 3
+
+    dates = pd.Series(
+        df.index.date,
+        index=df.index,
+    )
+
+    pv = (
+        typical
+        * df["volume"]
+    )
+
+    cumulative_pv = (
+        pv.groupby(dates).cumsum()
+    )
+
+    cumulative_volume = (
+        df["volume"]
+        .groupby(dates)
+        .cumsum()
+        .replace(0, float("nan"))
+    )
+
+    df["vwap"] = (
+        cumulative_pv
+        / cumulative_volume
+    )
+
+    return df
+
+
+# ============================================================
+# TARGET MOVE
+# ============================================================
+
+def target_for_symbol(symbol):
+
+    if symbol == "IWM":
+        return IWM_TARGET
+
+    if symbol == "SPY":
+        return SPY_TARGET
+
+    return DEFAULT_TARGET
+
+
+# ============================================================
+# PREMARKET LEVELS BY DATE
+# ============================================================
+
+def calculate_pm_levels(df):
+
+    levels = {}
+
+    for day in sorted(
+        set(df.index.date)
+    ):
+
+        d = df[
+            df.index.date == day
+        ]
+
+        pm = d[
+            (d.index.time >= PM_START)
+            & (d.index.time < PM_END)
+        ]
+
+        if pm.empty:
+            continue
+
+        levels[day] = {
+            "high": float(
+                pm["high"].max()
+            ),
+            "low": float(
+                pm["low"].min()
+            ),
+        }
+
+    return levels
+
+
+# ============================================================
+# SAME PINE-STYLE STRATEGY BACKTEST
+# ============================================================
+
+def backtest_symbol(
+    symbol,
+    df,
+):
+
+    if df.empty:
+        return None
+
+    df = add_indicators(df)
+
+    pm_levels = calculate_pm_levels(df)
+
+    wins = 0
+    losses = 0
+    total_trades = 0
+
+    call_wins = 0
+    call_losses = 0
+    call_trades = 0
+
+    put_wins = 0
+    put_losses = 0
+    put_trades = 0
+
+    target_move = target_for_symbol(
+        symbol
+    )
+
+    # Do not use today when determining
+    # today's qualifying watchlist.
+    today = datetime.now(NY).date()
+
+    days = sorted(
+        set(df.index.date)
+    )
+
+    for day in days:
+
+        if day >= today:
+            continue
+
+        if day not in pm_levels:
+            continue
+
+        pm_high = pm_levels[day]["high"]
+        pm_low = pm_levels[day]["low"]
+
+        day_df = df[
+            df.index.date == day
+        ]
+
+        rth = day_df[
+            (day_df.index.time >= RTH_START)
+            & (day_df.index.time < RTH_END)
+        ]
+
+        if len(rth) < 2:
+            continue
+
+        in_trade = False
+        long_trade = False
+
+        entry_price = None
+        target_price = None
+
+        trades_today = 0
+
+        previous_close = None
+
+        for timestamp, row in rth.iterrows():
+
+            close = float(
+                row["close"]
+            )
+
+            high = float(
+                row["high"]
+            )
+
+            low = float(
+                row["low"]
+            )
+
+            ema5 = float(
+                row["ema5"]
+            )
+
+            ema9 = float(
+                row["ema9"]
+            )
+
+            ema30 = float(
+                row["ema30"]
+            )
+
+            vwap = float(
+                row["vwap"]
+            )
+
+            # --------------------------------
+            # MANAGE OPEN TRADE
+            # --------------------------------
+
+            if in_trade:
+
+                if long_trade:
+
+                    # Pine checks TP first
+                    if high >= target_price:
+
+                        wins += 1
+                        total_trades += 1
+
+                        call_wins += 1
+                        call_trades += 1
+
+                        in_trade = False
+
+                    elif close <= ema9:
+
+                        move = (
+                            close
+                            - entry_price
+                        )
+
+                        total_trades += 1
+                        call_trades += 1
+
+                        if move > 0:
+                            wins += 1
+                            call_wins += 1
+                        else:
+                            losses += 1
+                            call_losses += 1
+
+                        in_trade = False
+
+                else:
+
+                    if low <= target_price:
+
+                        wins += 1
+                        total_trades += 1
+
+                        put_wins += 1
+                        put_trades += 1
+
+                        in_trade = False
+
+                    elif close >= ema9:
+
+                        move = (
+                            entry_price
+                            - close
+                        )
+
+                        total_trades += 1
+                        put_trades += 1
+
+                        if move > 0:
+                            wins += 1
+                            put_wins += 1
+                        else:
+                            losses += 1
+                            put_losses += 1
+
+                        in_trade = False
+
+            # --------------------------------
+            # NEW SIGNAL
+            # --------------------------------
+
+            if (
+                not in_trade
+                and trades_today
+                < MAX_TRADES_PER_DAY
+                and previous_close
+                is not None
+            ):
+
+                bull_trend = (
+                    ema5 > ema9
+                    and ema9 > ema30
+                )
+
+                bear_trend = (
+                    ema5 < ema9
+                    and ema9 < ema30
+                )
+
+                long_break = (
+                    close > pm_high
+                    and previous_close <= pm_high
+                    and bull_trend
+                    and close > vwap
+                )
+
+                short_break = (
+                    close < pm_low
+                    and previous_close >= pm_low
+                    and bear_trend
+                    and close < vwap
+                )
+
+                if long_break:
+
+                    in_trade = True
+                    long_trade = True
+
+                    entry_price = close
+
+                    target_price = (
+                        close
+                        + target_move
+                    )
+
+                    trades_today += 1
+
+                elif short_break:
+
+                    in_trade = True
+                    long_trade = False
+
+                    entry_price = close
+
+                    target_price = (
+                        close
+                        - target_move
+                    )
+
+                    trades_today += 1
+
+            previous_close = close
+
+    if total_trades == 0:
+        return None
+
+    win_rate = (
+        wins
+        * 100.0
+        / total_trades
+    )
+
+    call_win_rate = (
+        call_wins
+        * 100.0
+        / call_trades
+        if call_trades > 0
+        else 0
+    )
+
+    put_win_rate = (
+        put_wins
+        * 100.0
+        / put_trades
+        if put_trades > 0
+        else 0
+    )
+
+    return {
+        "symbol": symbol,
+        "overall_win_rate": round(
+            win_rate,
+            1,
+        ),
+        "call_win_rate": round(
+            call_win_rate,
+            1,
+        ),
+        "put_win_rate": round(
+            put_win_rate,
+            1,
+        ),
+        "wins": wins,
+        "losses": losses,
+        "total_trades": total_trades,
+        "call_trades": call_trades,
+        "put_trades": put_trades,
+    }
+
+
+# ============================================================
+# MORNING WATCHLIST SCAN
+# ============================================================
+
+def build_daily_watchlist():
+
+    now = datetime.now(NY)
+
+    logging.info(
+        "======================================"
+    )
+    logging.info(
+        "MORNING 90%% SCANNER STARTED"
+    )
+    logging.info(
+        "Time: %s",
+        now,
+    )
+    logging.info(
+        "======================================"
+    )
+
+    with state_lock:
+        BOT_STATE["scan_started"] = (
+            now.isoformat()
+        )
+
+        BOT_STATE["status"] = (
+            "morning_scan"
+        )
+
+    # ----------------------------------------
+    # FIND ACTIVE STOCKS
+    # ----------------------------------------
+
+    try:
+
+        symbols = get_most_active_stocks()
+
+    except Exception as exc:
+
+        logging.exception(
+            "Most-active scanner failed"
+        )
+
+        with state_lock:
+            BOT_STATE["last_error"] = str(
+                exc
+            )
+
+        return
+
+    symbols = symbols[
+        :MAX_SCAN_CANDIDATES
+    ]
+
+    logging.info(
+        "Candidates found: %s",
+        len(symbols),
+    )
+
+    qualified = {}
+
+    # ----------------------------------------
+    # CHECK EACH STOCK
+    # ----------------------------------------
+
+    for number, symbol in enumerate(
+        symbols,
+        start=1,
+    ):
+
+        try:
+
+            logging.info(
+                "[%s/%s] Checking %s",
+                number,
+                len(symbols),
+                symbol,
+            )
+
+            # Must have 0DTE option contracts
+            if not has_0dte_options(
+                symbol
+            ):
+
+                logging.info(
+                    "%s SKIP - no 0DTE options",
+                    symbol,
+                )
+
+                continue
+
+            bars = fetch_bars(
+                symbol,
+                BACKTEST_DAYS,
+            )
+
+            stats = backtest_symbol(
+                symbol,
+                bars,
+            )
+
+            if not stats:
+                continue
+
+            logging.info(
+                "%s | %.1f%% | trades=%s",
+                symbol,
+                stats[
+                    "overall_win_rate"
+                ],
+                stats[
+                    "total_trades"
+                ],
+            )
+
+            # HARD 90% FILTER
+            if (
+                stats[
+                    "overall_win_rate"
+                ]
+                < MIN_OVERALL_WIN_RATE
+            ):
+                continue
+
+            if (
+                stats[
+                    "total_trades"
+                ]
+                < MIN_COMPLETED_TRADES
+            ):
+                continue
+
+            qualified[symbol] = stats
+
+            logging.info(
+                "✅ QUALIFIED: %s %.1f%%",
+                symbol,
+                stats[
+                    "overall_win_rate"
+                ],
+            )
+
+        except Exception as exc:
+
+            logging.warning(
+                "%s scan error: %s",
+                symbol,
+                exc,
+            )
+
+        time.sleep(
+            SCAN_PAUSE_SECONDS
+        )
+
+    # ----------------------------------------
+    # SORT BEST FIRST
+    # ----------------------------------------
+
+    qualified = dict(
+        sorted(
+            qualified.items(),
+            key=lambda x:
+                x[1][
+                    "overall_win_rate"
+                ],
+            reverse=True,
+        )
+    )
+
+    watchlist = list(
+        qualified.keys()
+    )
+
+    # ----------------------------------------
+    # LOCK TODAY'S LIST
+    # ----------------------------------------
+
+    with state_lock:
+
+        BOT_STATE[
+            "daily_watchlist"
+        ] = watchlist
+
+        BOT_STATE[
+            "qualified_details"
+        ] = qualified
+
+        BOT_STATE[
+            "scan_date"
+        ] = now.date().isoformat()
+
+        BOT_STATE[
+            "scan_finished"
+        ] = (
+            datetime.now(NY)
+            .isoformat()
+        )
+
+        BOT_STATE[
+            "status"
+        ] = "watchlist_ready"
+
+    logging.info(
+        "======================================"
+    )
+
+    logging.info(
+        "TODAY'S LOCKED 90%% WATCHLIST:"
+    )
+
+    if not watchlist:
+
+        logging.info(
+            "NO STOCKS QUALIFIED TODAY"
+        )
+
+    for symbol in watchlist:
+
+        stats = qualified[
+            symbol
+        ]
+
+        logging.info(
+            "%s | Overall %.1f%% | "
+            "CALL %.1f%% | PUT %.1f%% | "
+            "Trades %s",
+            symbol,
+            stats[
+                "overall_win_rate"
+            ],
+            stats[
+                "call_win_rate"
+            ],
+            stats[
+                "put_win_rate"
+            ],
+            stats[
+                "total_trades"
+            ],
+        )
+
+    logging.info(
+        "======================================"
+    )
+
+
+# ============================================================
+# TODAY'S PREMARKET LEVELS
+# ============================================================
+
+def today_pm_levels(df):
+
+    if df.empty:
+        return None
+
+    today = datetime.now(NY).date()
+
+    d = df[
+        df.index.date == today
+    ]
+
+    pm = d[
+        (d.index.time >= PM_START)
+        & (d.index.time < PM_END)
+    ]
+
+    if pm.empty:
+        return None
+
+    return {
+        "high": float(
+            pm["high"].max()
+        ),
+        "low": float(
+            pm["low"].min()
+        ),
+    }
+
+
+# ============================================================
+# CURRENT SIGNAL
+# ============================================================
+
+def get_current_signal(
+    symbol,
+):
+
+    df = fetch_bars(
+        symbol,
+        3,
+    )
+
+    if df.empty:
+        return None
+
+    df = add_indicators(
+        df
+    )
+
+    pm = today_pm_levels(
+        df
+    )
+
+    if not pm:
+        return None
+
+    today = datetime.now(NY).date()
+
+    rth = df[
+        (df.index.date == today)
+        & (
+            df.index.time
+            >= RTH_START
+        )
+        & (
+            df.index.time
+            < RTH_END
+        )
+    ]
+
+    if len(rth) < 2:
+        return None
+
+    previous = rth.iloc[-2]
+    current = rth.iloc[-1]
+
+    timestamp = rth.index[-1]
+
+    close = float(
+        current["close"]
+    )
+
+    previous_close = float(
+        previous["close"]
+    )
+
+    ema5 = float(
+        current["ema5"]
+    )
+
+    ema9 = float(
+        current["ema9"]
+    )
+
+    ema30 = float(
+        current["ema30"]
+    )
+
+    vwap = float(
+        current["vwap"]
+    )
+
+    bull_trend = (
+        ema5 > ema9
+        and ema9 > ema30
+    )
+
+    bear_trend = (
+        ema5 < ema9
+        and ema9 < ema30
+    )
+
+    call_signal = (
+        close > pm["high"]
+        and previous_close
+        <= pm["high"]
+        and bull_trend
+        and close > vwap
+    )
+
+    put_signal = (
+        close < pm["low"]
+        and previous_close
+        >= pm["low"]
+        and bear_trend
+        and close < vwap
+    )
+
+    if call_signal:
+
+        return {
+            "symbol": symbol,
+            "signal": "CALL",
+            "price": close,
+            "ema9": ema9,
+            "pm_high": pm["high"],
+            "pm_low": pm["low"],
+            "bar": str(timestamp),
+        }
+
+    if put_signal:
+
+        return {
+            "symbol": symbol,
+            "signal": "PUT",
+            "price": close,
+            "ema9": ema9,
+            "pm_high": pm["high"],
+            "pm_low": pm["low"],
+            "bar": str(timestamp),
+        }
+
+    return None
+
+
+# ============================================================
+# POSITIONS
+# ============================================================
+
+def get_positions():
+
+    try:
+        return api_request(
+            "GET",
+            "/v2/positions",
+        )
+
+    except Exception:
+        return []
+
+
+def get_open_orders():
+
+    try:
+
+        return api_request(
+            "GET",
+            "/v2/orders",
+            params={
+                "status": "open",
+                "limit": 500,
+            },
+        )
+
+    except Exception:
+        return []
+
+
+def has_underlying_position(
+    underlying,
+):
+
+    underlying = (
+        underlying.upper()
+    )
+
+    for position in get_positions():
+
+        symbol = str(
+            position.get(
+                "symbol",
+                "",
+            )
+        ).upper()
+
+        if symbol.startswith(
+            underlying
+        ):
+            return True
+
+    for order in get_open_orders():
+
+        symbol = str(
+            order.get(
+                "symbol",
+                "",
+            )
+        ).upper()
+
+        if symbol.startswith(
+            underlying
+        ):
+            return True
+
+    return False
+
+
+# ============================================================
+# ATM 0DTE CONTRACT
 # ============================================================
 
 def choose_atm_contract(
     underlying,
     direction,
-    underlying_price
+    underlying_price,
 ):
-    contracts = get_0dte_contracts(
-        underlying,
-        direction
+
+    option_type = (
+        "call"
+        if direction == "CALL"
+        else "put"
     )
 
-    if not contracts:
-        raise RuntimeError(
-            f"No 0DTE {direction} contracts "
-            f"found for {underlying}"
+    contracts = get_option_contracts(
+        underlying,
+        option_type,
+    )
+
+    tradable = [
+        c
+        for c in contracts
+        if c.get(
+            "tradable",
+            True,
         )
+    ]
 
-    best_contract = None
-    best_distance = None
+    if not tradable:
 
-    for contract in contracts:
-
-        try:
-            strike = float(
-                contract["strike_price"]
-            )
-
-        except Exception:
-            continue
-
-        distance = abs(
-            strike
-            - underlying_price
-        )
-
-        if (
-            best_distance is None
-            or distance < best_distance
-        ):
-            best_distance = distance
-            best_contract = contract
-
-    if best_contract is None:
         raise RuntimeError(
-            f"Unable to select ATM option "
+            f"No tradable 0DTE "
+            f"{direction} contracts "
             f"for {underlying}"
         )
 
-    return best_contract
+    best = min(
+        tradable,
+        key=lambda c:
+            abs(
+                float(
+                    c[
+                        "strike_price"
+                    ]
+                )
+                - underlying_price
+            ),
+    )
+
+    return best
 
 
 # ============================================================
 # OPTION QUOTE
 # ============================================================
 
-def get_option_midpoint(
-    option_symbol
+def get_option_mid(
+    symbol,
 ):
-    params = {
-        "symbols": option_symbol
-    }
 
-    try:
-        result = alpaca_request(
-            "GET",
-            "/v1beta1/options/quotes/latest",
-            params=params,
-            base_url=DATA_BASE_URL
-        )
+    result = api_request(
+        "GET",
+        "/v1beta1/options/quotes/latest",
+        base=DATA_BASE_URL,
+        params={
+            "symbols": symbol,
+        },
+    )
 
-        quotes = result.get(
-            "quotes",
-            {}
-        )
+    quote = (
+        result
+        .get("quotes", {})
+        .get(symbol, {})
+    )
 
-        quote = quotes.get(
-            option_symbol,
-            {}
-        )
+    bid = float(
+        quote.get("bp", 0)
+        or 0
+    )
 
-        bid = float(
-            quote.get(
-                "bp",
-                0
-            )
-            or 0
-        )
+    ask = float(
+        quote.get("ap", 0)
+        or 0
+    )
 
-        ask = float(
-            quote.get(
-                "ap",
-                0
-            )
-            or 0
-        )
+    if bid > 0 and ask > 0:
+        return (
+            bid + ask
+        ) / 2
 
-        if bid > 0 and ask > 0:
-            return (
-                bid + ask
-            ) / 2
+    if ask > 0:
+        return ask
 
-        if ask > 0:
-            return ask
-
-        if bid > 0:
-            return bid
-
-    except Exception as exc:
-        logging.warning(
-            "Quote unavailable for %s: %s",
-            option_symbol,
-            exc
-        )
+    if bid > 0:
+        return bid
 
     return None
 
 
 # ============================================================
-# POSITION SIZE
+# BUY OPTION
 # ============================================================
 
-def calculate_contract_quantity(
-    option_price
+def submit_option_order(
+    option_symbol,
+    qty,
 ):
+
+    payload = {
+        "symbol": option_symbol,
+        "qty": str(
+            int(qty)
+        ),
+        "side": "buy",
+        "type": "market",
+        "time_in_force": "day",
+    }
+
+    if not AUTO_TRADE:
+
+        logging.info(
+            "SIMULATED ORDER: %s",
+            payload,
+        )
+
+        return {
+            "simulated": True,
+            "order": payload,
+        }
+
+    return api_request(
+        "POST",
+        "/v2/orders",
+        payload=payload,
+    )
+
+
+# ============================================================
+# EXECUTE QUALIFIED SIGNAL
+# ============================================================
+
+def execute_signal(
+    symbol,
+    signal,
+):
+
+    # ----------------------------------------
+    # FINAL WATCHLIST CHECK
+    # ----------------------------------------
+
+    with state_lock:
+
+        watchlist = BOT_STATE[
+            "daily_watchlist"
+        ].copy()
+
+        stats = BOT_STATE[
+            "qualified_details"
+        ].get(symbol)
+
+    if symbol not in watchlist:
+
+        logging.warning(
+            "%s BLOCKED - "
+            "not on today's locked list",
+            symbol,
+        )
+
+        return None
+
+    if not stats:
+        return None
+
     if (
-        option_price is None
-        or option_price <= 0
+        stats["overall_win_rate"]
+        < MIN_OVERALL_WIN_RATE
     ):
-        return 1
+
+        logging.warning(
+            "%s BLOCKED - "
+            "win rate fell below 90",
+            symbol,
+        )
+
+        return None
+
+    if has_underlying_position(
+        symbol
+    ):
+
+        logging.info(
+            "%s SKIP - "
+            "already has position/order",
+            symbol,
+        )
+
+        return None
+
+    positions = get_positions()
+
+    if (
+        len(positions)
+        >= MAX_OPEN_POSITIONS
+    ):
+
+        logging.info(
+            "Max positions reached"
+        )
+
+        return None
+
+    # ----------------------------------------
+    # FIND ATM 0DTE
+    # ----------------------------------------
+
+    contract = choose_atm_contract(
+        symbol,
+        signal["signal"],
+        signal["price"],
+    )
+
+    option_symbol = contract[
+        "symbol"
+    ]
+
+    mid = get_option_mid(
+        option_symbol
+    )
+
+    if not mid or mid <= 0:
+
+        logging.warning(
+            "%s no option price",
+            option_symbol,
+        )
+
+        return None
 
     contract_cost = (
-        option_price
+        mid
         * 100
     )
 
@@ -407,385 +1581,482 @@ def calculate_contract_quantity(
         / contract_cost
     )
 
-    # At least 1 contract
-    return max(
-        1,
-        qty
-    )
-
-
-# ============================================================
-# SUBMIT OPTION ORDER
-# ============================================================
-
-def buy_option(
-    option_symbol,
-    qty
-):
-    order = {
-        "symbol": option_symbol,
-        "qty": str(int(qty)),
-        "side": "buy",
-        "type": "market",
-        "time_in_force": "day",
-    }
-
-    if not AUTO_TRADE:
+    if qty < 1:
 
         logging.warning(
-            "AUTO_TRADE OFF - simulated order: %s",
-            order
+            "%s costs $%.2f per "
+            "contract - exceeds "
+            "position budget $%.2f",
+            option_symbol,
+            contract_cost,
+            POSITION_DOLLARS,
         )
 
-        return {
-            "paper_simulation": True,
-            "order": order,
-        }
+        return None
 
-    result = alpaca_request(
-        "POST",
-        "/v2/orders",
-        json=order
+    # ----------------------------------------
+    # ORDER
+    # ----------------------------------------
+
+    result = submit_option_order(
+        option_symbol,
+        qty,
+    )
+
+    target_move = target_for_symbol(
+        symbol
+    )
+
+    active_trades[symbol] = {
+        "underlying": symbol,
+        "option_symbol": option_symbol,
+        "direction": signal["signal"],
+        "entry_underlying": signal[
+            "price"
+        ],
+        "target_underlying": (
+            signal["price"]
+            + target_move
+            if signal["signal"]
+            == "CALL"
+            else signal["price"]
+            - target_move
+        ),
+        "qty": qty,
+        "win_rate": stats[
+            "overall_win_rate"
+        ],
+        "entered": datetime.now(
+            NY
+        ).isoformat(),
+    }
+
+    order_record = {
+        "time": datetime.now(
+            NY
+        ).isoformat(),
+        "symbol": symbol,
+        "direction": signal[
+            "signal"
+        ],
+        "win_rate": stats[
+            "overall_win_rate"
+        ],
+        "option": option_symbol,
+        "qty": qty,
+        "option_mid": mid,
+        "result": result,
+    }
+
+    with state_lock:
+
+        BOT_STATE[
+            "orders"
+        ].append(
+            order_record
+        )
+
+        BOT_STATE[
+            "orders"
+        ] = BOT_STATE[
+            "orders"
+        ][-50:]
+
+    logging.info(
+        "✅ ORDER %s | %s | "
+        "%.1f%% | %s x%s",
+        symbol,
+        signal["signal"],
+        stats[
+            "overall_win_rate"
+        ],
+        option_symbol,
+        qty,
     )
 
     return result
 
 
 # ============================================================
-# VALIDATE TRADINGVIEW MESSAGE
+# MONITOR LOCKED WATCHLIST
 # ============================================================
 
-def validate_signal(data):
+def monitor_watchlist():
 
-    symbol = str(
-        data.get(
-            "symbol",
-            ""
-        )
-    ).upper().strip()
+    with state_lock:
 
-    signal = str(
-        data.get(
-            "signal",
-            data.get(
-                "direction",
-                ""
+        watchlist = BOT_STATE[
+            "daily_watchlist"
+        ].copy()
+
+    if not watchlist:
+        return
+
+    new_trades = 0
+
+    for symbol in watchlist:
+
+        if (
+            new_trades
+            >= MAX_NEW_TRADES_PER_CYCLE
+        ):
+            break
+
+        try:
+
+            signal = get_current_signal(
+                symbol
             )
-        )
-    ).upper().strip()
 
-    try:
-        win_rate = float(
-            data.get(
-                "overall_win_rate",
-                0
+            if not signal:
+                continue
+
+            signal_key = (
+                f"{symbol}:"
+                f"{signal['bar']}:"
+                f"{signal['signal']}"
             )
-        )
 
-    except Exception:
-        win_rate = 0
+            if (
+                last_signal_bar.get(
+                    symbol
+                )
+                == signal_key
+            ):
+                continue
 
-    try:
-        price = float(
-            data.get(
-                "price",
-                0
+            last_signal_bar[
+                symbol
+            ] = signal_key
+
+            with state_lock:
+
+                BOT_STATE[
+                    "current_signals"
+                ][symbol] = signal
+
+            logging.info(
+                "SIGNAL %s %s",
+                symbol,
+                signal["signal"],
             )
-        )
 
-    except Exception:
-        price = 0
-
-    if not symbol:
-        return False, "Missing symbol", None
-
-    if signal not in (
-        "CALL",
-        "PUT"
-    ):
-        return (
-            False,
-            f"Invalid signal: {signal}",
-            None
-        )
-
-    if win_rate < MIN_WIN_RATE:
-        return (
-            False,
-            (
-                f"{symbol} rejected: "
-                f"overall win rate "
-                f"{win_rate:.1f}% "
-                f"is below "
-                f"{MIN_WIN_RATE:.1f}%"
-            ),
-            None
-        )
-
-    if price <= 0:
-        return (
-            False,
-            "Invalid underlying price",
-            None
-        )
-
-    validated = {
-        "symbol": symbol,
-        "signal": signal,
-        "win_rate": win_rate,
-        "price": price,
-        "call_win_rate": data.get(
-            "call_win_rate"
-        ),
-        "put_win_rate": data.get(
-            "put_win_rate"
-        ),
-        "total_trades": data.get(
-            "total_trades"
-        ),
-    }
-
-    return (
-        True,
-        "QUALIFIED",
-        validated
-    )
-
-
-# ============================================================
-# EXECUTE QUALIFIED SIGNAL
-# ============================================================
-
-def execute_signal(signal):
-
-    symbol = signal["symbol"]
-    direction = signal["signal"]
-
-    logging.info(
-        "%s %s QUALIFIED | WIN RATE %.1f%%",
-        symbol,
-        direction,
-        signal["win_rate"]
-    )
-
-    # ----------------------------------------
-    # ENTRY TIME
-    # ----------------------------------------
-
-    if not entry_time_allowed():
-        return {
-            "accepted": False,
-            "reason": "Outside bot entry window"
-        }
-
-    # ----------------------------------------
-    # MAX POSITIONS
-    # ----------------------------------------
-
-    positions = open_position_count()
-
-    if positions >= MAX_OPEN_POSITIONS:
-        return {
-            "accepted": False,
-            "reason": (
-                "Maximum open positions "
-                "already reached"
+            result = execute_signal(
+                symbol,
+                signal,
             )
-        }
 
-    # ----------------------------------------
-    # DUPLICATE UNDERLYING
-    # ----------------------------------------
+            if result is not None:
+                new_trades += 1
 
-    if has_underlying_position(symbol):
-        return {
-            "accepted": False,
-            "reason": (
-                f"Existing position already "
-                f"found for {symbol}"
-            )
-        }
-
-    # ----------------------------------------
-    # FIND ATM 0DTE
-    # ----------------------------------------
-
-    contract = choose_atm_contract(
-        underlying=symbol,
-        direction=direction,
-        underlying_price=signal["price"]
-    )
-
-    option_symbol = contract["symbol"]
-
-    strike = float(
-        contract["strike_price"]
-    )
-
-    # ----------------------------------------
-    # OPTION PRICE
-    # ----------------------------------------
-
-    midpoint = get_option_midpoint(
-        option_symbol
-    )
-
-    qty = calculate_contract_quantity(
-        midpoint
-    )
-
-    # ----------------------------------------
-    # SEND ORDER
-    # ----------------------------------------
-
-    order = buy_option(
-        option_symbol,
-        qty
-    )
-
-    logging.info(
-        "ORDER | %s %s | %s | "
-        "strike %.2f | qty %s",
-        symbol,
-        direction,
-        option_symbol,
-        strike,
-        qty
-    )
-
-    return {
-        "accepted": True,
-        "underlying": symbol,
-        "direction": direction,
-        "overall_win_rate": signal["win_rate"],
-        "option_symbol": option_symbol,
-        "expiration": contract.get(
-            "expiration_date"
-        ),
-        "strike": strike,
-        "option_price": midpoint,
-        "qty": qty,
-        "auto_trade": AUTO_TRADE,
-        "order": order,
-    }
-
-
-# ============================================================
-# TRADINGVIEW WEBHOOK
-# ============================================================
-
-@app.route(
-    "/webhook",
-    methods=["POST"]
-)
-def tradingview_webhook():
-
-    try:
-
-        data = request.get_json(
-            force=True,
-            silent=False
-        )
-
-        logging.info(
-            "WEBHOOK RECEIVED: %s",
-            data
-        )
-
-        valid, reason, signal = (
-            validate_signal(data)
-        )
-
-        if not valid:
+        except Exception as exc:
 
             logging.warning(
-                "SIGNAL REJECTED: %s",
-                reason
+                "%s monitor error: %s",
+                symbol,
+                exc,
             )
 
-            return jsonify({
-                "ok": True,
-                "accepted": False,
-                "reason": reason,
-            }), 200
-
-        result = execute_signal(
-            signal
-        )
-
-        return jsonify({
-            "ok": True,
-            **result
-        }), 200
-
-    except Exception as exc:
-
-        logging.exception(
-            "WEBHOOK ERROR"
-        )
-
-        return jsonify({
-            "ok": False,
-            "error": str(exc),
-        }), 500
+        time.sleep(0.15)
 
 
 # ============================================================
-# HOME
+# DETERMINE WHETHER MORNING SCAN IS DUE
+# ============================================================
+
+def morning_scan_due():
+
+    now = datetime.now(NY)
+
+    if now.weekday() >= 5:
+        return False
+
+    today = (
+        now.date()
+        .isoformat()
+    )
+
+    with state_lock:
+
+        already_scanned = (
+            BOT_STATE[
+                "scan_date"
+            ]
+            == today
+        )
+
+    if already_scanned:
+        return False
+
+    scan_time = dt_time(
+        SCAN_HOUR,
+        SCAN_MINUTE,
+    )
+
+    # Once 8:45 arrives, build the list.
+    # If Render starts late, it still builds
+    # today's list once.
+    return (
+        now.time()
+        >= scan_time
+    )
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+def bot_loop():
+
+    logging.info(
+        "======================================"
+    )
+
+    logging.info(
+        "90%% PREMARKET WATCHLIST BOT STARTED"
+    )
+
+    logging.info(
+        "AUTO_TRADE = %s",
+        AUTO_TRADE,
+    )
+
+    logging.info(
+        "Morning scan = %02d:%02d ET",
+        SCAN_HOUR,
+        SCAN_MINUTE,
+    )
+
+    logging.info(
+        "Minimum win rate = %.1f%%",
+        MIN_OVERALL_WIN_RATE,
+    )
+
+    logging.info(
+        "======================================"
+    )
+
+    while True:
+
+        try:
+
+            now = datetime.now(NY)
+
+            with state_lock:
+
+                BOT_STATE[
+                    "last_cycle"
+                ] = now.isoformat()
+
+                BOT_STATE[
+                    "last_error"
+                ] = None
+
+            # --------------------------------
+            # MORNING SCAN
+            # --------------------------------
+
+            if morning_scan_due():
+
+                build_daily_watchlist()
+
+            # --------------------------------
+            # MARKET HOURS
+            # --------------------------------
+
+            if (
+                now.weekday() < 5
+                and now.time()
+                >= RTH_START
+                and now.time()
+                <= LAST_ENTRY_TIME
+            ):
+
+                with state_lock:
+
+                    today_ready = (
+                        BOT_STATE[
+                            "scan_date"
+                        ]
+                        == now.date()
+                        .isoformat()
+                    )
+
+                # Only trade after today's
+                # morning list exists.
+                if today_ready:
+
+                    monitor_watchlist()
+
+            # --------------------------------
+            # AFTER HOURS
+            # --------------------------------
+
+            if (
+                now.time()
+                > RTH_END
+            ):
+
+                with state_lock:
+                    BOT_STATE[
+                        "status"
+                    ] = "market_closed"
+
+        except Exception as exc:
+
+            logging.exception(
+                "BOT LOOP ERROR"
+            )
+
+            with state_lock:
+
+                BOT_STATE[
+                    "last_error"
+                ] = str(exc)
+
+        time.sleep(
+            LOOP_SECONDS
+        )
+
+
+# ============================================================
+# WEB ROUTES
 # ============================================================
 
 @app.route("/")
 def home():
 
-    return jsonify({
-        "status": "online",
-        "bot": (
-            "TradingView 90% "
-            "0DTE Alpaca Bot"
-        ),
-        "paper": True,
-        "auto_trade": AUTO_TRADE,
-        "minimum_win_rate": MIN_WIN_RATE,
-        "position_dollars": POSITION_DOLLARS,
-        "max_open_positions": MAX_OPEN_POSITIONS,
-        "scanner": "disabled",
-        "execution_source": (
-            "TradingView webhook only"
-        ),
-        "webhook": "/webhook",
-    })
+    with state_lock:
+
+        return jsonify({
+            "bot": (
+                "90% Premarket "
+                "Locked Watchlist Bot"
+            ),
+            "status": BOT_STATE[
+                "status"
+            ],
+            "auto_trade": AUTO_TRADE,
+            "minimum_win_rate": (
+                MIN_OVERALL_WIN_RATE
+            ),
+            "scan_time_et": (
+                f"{SCAN_HOUR:02d}:"
+                f"{SCAN_MINUTE:02d}"
+            ),
+            "scan_date": BOT_STATE[
+                "scan_date"
+            ],
+            "watchlist_count": len(
+                BOT_STATE[
+                    "daily_watchlist"
+                ]
+            ),
+            "daily_watchlist": (
+                BOT_STATE[
+                    "daily_watchlist"
+                ]
+            ),
+        })
 
 
-# ============================================================
-# HEALTH
-# ============================================================
+@app.route("/watchlist")
+def watchlist():
+
+    with state_lock:
+
+        return jsonify({
+            "scan_date": BOT_STATE[
+                "scan_date"
+            ],
+            "scan_started": BOT_STATE[
+                "scan_started"
+            ],
+            "scan_finished": BOT_STATE[
+                "scan_finished"
+            ],
+            "locked": True,
+            "minimum_win_rate": (
+                MIN_OVERALL_WIN_RATE
+            ),
+            "symbols": BOT_STATE[
+                "daily_watchlist"
+            ],
+            "details": BOT_STATE[
+                "qualified_details"
+            ],
+        })
+
+
+@app.route("/signals")
+def signals():
+
+    with state_lock:
+
+        return jsonify(
+            BOT_STATE[
+                "current_signals"
+            ]
+        )
+
+
+@app.route("/orders")
+def orders():
+
+    with state_lock:
+
+        return jsonify(
+            BOT_STATE[
+                "orders"
+            ]
+        )
+
 
 @app.route("/health")
 def health():
 
     try:
+
         account = get_account()
 
         return jsonify({
             "status": "healthy",
-            "alpaca_connected": True,
-            "account_status": account.get(
-                "status"
+            "alpaca": True,
+            "account_status": (
+                account.get(
+                    "status"
+                )
             ),
-            "auto_trade": AUTO_TRADE,
+            "auto_trade": (
+                AUTO_TRADE
+            ),
         })
 
     except Exception as exc:
 
         return jsonify({
             "status": "error",
-            "alpaca_connected": False,
+            "alpaca": False,
             "error": str(exc),
         }), 500
 
 
 # ============================================================
-# START
+# START BOT THREAD
+# ============================================================
+
+if RUN_BOT_LOOP:
+
+    thread = threading.Thread(
+        target=bot_loop,
+        daemon=True,
+    )
+
+    thread.start()
+
+
+# ============================================================
+# FLASK START
 # ============================================================
 
 if __name__ == "__main__":
@@ -797,21 +2068,7 @@ if __name__ == "__main__":
         )
     )
 
-    logging.info(
-        "TradingView 90%% Alpaca bot starting"
-    )
-
-    logging.info(
-        "AUTO_TRADE=%s",
-        AUTO_TRADE
-    )
-
-    logging.info(
-        "MIN_WIN_RATE=%s",
-        MIN_WIN_RATE
-    )
-
     app.run(
         host="0.0.0.0",
-        port=port
+        port=port,
     )
