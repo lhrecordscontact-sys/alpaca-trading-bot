@@ -1,2 +1,5 @@
 flask
+requests
+pandas
+numpy
 alpaca-py
