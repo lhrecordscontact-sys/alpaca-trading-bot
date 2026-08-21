@@ -26,12 +26,20 @@ UTC = ZoneInfo("UTC")
 
 
 # ============================================================
-# ALPACA SETTINGS
+# ALPACA
 # ============================================================
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
+ALPACA_API_KEY = os.getenv(
+    "ALPACA_API_KEY",
+    ""
+).strip()
 
+ALPACA_SECRET_KEY = os.getenv(
+    "ALPACA_SECRET_KEY",
+    ""
+).strip()
+
+TRADING_URL = "https://paper-api.alpaca.markets"
 DATA_URL = "https://data.alpaca.markets"
 
 DATA_FEED = os.getenv(
@@ -43,44 +51,6 @@ HEADERS = {
     "APCA-API-KEY-ID": ALPACA_API_KEY,
     "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
 }
-
-
-# ============================================================
-# YOUR WATCHLIST
-#
-# You can change this later from Render with:
-#
-# WATCHLIST=TSLA,NVDA,AAPL,MU,META,...
-# ============================================================
-
-DEFAULT_WATCHLIST = [
-    "TSLA",
-    "NVDA",
-    "AAPL",
-    "SPCX",
-    "MU",
-    "META",
-    "AMZN",
-    "MSFT",
-    "AMD",
-    "PLTR",
-    "SNDK",
-    "MRNA",
-    "GOOGL",
-    "MSTR",
-    "SPY",
-    "IWM",
-    "QQQ",
-]
-
-WATCHLIST = [
-    symbol.strip().upper()
-    for symbol in os.getenv(
-        "WATCHLIST",
-        ",".join(DEFAULT_WATCHLIST)
-    ).split(",")
-    if symbol.strip()
-]
 
 
 # ============================================================
@@ -101,6 +71,9 @@ RTH_END = dt_time(16, 0)
 
 SPY_TARGET = 1.00
 IWM_TARGET = 0.50
+
+# Your Pine uses SPY target for symbols
+# other than IWM too.
 DEFAULT_TARGET = 1.00
 
 MAX_TRADES_PER_DAY = 2
@@ -112,8 +85,9 @@ MIN_WIN_RATE = float(
     )
 )
 
-# Keep this at 1 to behave like your Pine stats.
-# Later you can raise it to 10, 20, etc. if wanted.
+# Pine itself allows even 1 completed CALL
+# to produce a percentage.
+# Leave at 1 for Pine-style behavior.
 MIN_SIDE_TRADES = int(
     os.getenv(
         "MIN_SIDE_TRADES",
@@ -121,7 +95,8 @@ MIN_SIDE_TRADES = int(
     )
 )
 
-# Number of calendar days downloaded from Alpaca.
+# Amount of historical data the Python scanner
+# downloads for each stock.
 HISTORY_DAYS = int(
     os.getenv(
         "HISTORY_DAYS",
@@ -129,24 +104,44 @@ HISTORY_DAYS = int(
     )
 )
 
-# Rescan frequency.
+# Symbols downloaded in groups instead of
+# one request per ticker.
+BATCH_SIZE = int(
+    os.getenv(
+        "BATCH_SIZE",
+        "40"
+    )
+)
+
+REQUEST_PAUSE = float(
+    os.getenv(
+        "REQUEST_PAUSE",
+        "0.30"
+    )
+)
+
+# Automatically rescan.
 SCAN_EVERY_MINUTES = int(
     os.getenv(
         "SCAN_EVERY_MINUTES",
-        "15"
+        "60"
     )
 )
 
 
 # ============================================================
-# SCANNER STATE
+# STATE
 # ============================================================
 
 lock = threading.Lock()
 
 STATE = {
     "status": "STARTING",
+    "universe_count": 0,
+    "scanned_count": 0,
+    "qualified_count": 0,
     "last_scan": None,
+    "scan_started": None,
     "results": [],
     "qualified": [],
     "error": None,
@@ -154,7 +149,93 @@ STATE = {
 
 
 # ============================================================
-# TARGET MOVE
+# API REQUEST
+# ============================================================
+
+def api_request(
+    url,
+    params=None,
+    timeout=60
+):
+
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        params=params,
+        timeout=timeout,
+    )
+
+    if not response.ok:
+
+        raise RuntimeError(
+            f"{response.status_code}: "
+            f"{response.text[:500]}"
+        )
+
+    return response.json()
+
+
+# ============================================================
+# GET ENTIRE ACTIVE U.S. STOCK UNIVERSE
+# ============================================================
+
+def get_entire_market():
+
+    logging.info(
+        "Downloading full Alpaca stock universe..."
+    )
+
+    result = api_request(
+        f"{TRADING_URL}/v2/assets",
+        params={
+            "status": "active",
+            "asset_class": "us_equity",
+        }
+    )
+
+    symbols = []
+
+    for asset in result:
+
+        symbol = str(
+            asset.get(
+                "symbol",
+                ""
+            )
+        ).upper().strip()
+
+        if not symbol:
+            continue
+
+        # Only active/tradable stocks.
+        if not asset.get(
+            "tradable",
+            False
+        ):
+            continue
+
+        # Skip malformed / unusual slash symbols.
+        if "/" in symbol:
+            continue
+
+        symbols.append(
+            symbol
+        )
+
+    symbols = sorted(
+        set(symbols)
+    )
+
+    logging.info(
+        "Full market universe: %s symbols",
+        len(symbols)
+    )
+
+    return symbols
+
+
+# ============================================================
+# TARGET
 # ============================================================
 
 def target_move(symbol):
@@ -169,43 +250,25 @@ def target_move(symbol):
 
 
 # ============================================================
-# ALPACA REQUEST
+# DOWNLOAD MULTIPLE STOCKS AT ONCE
 # ============================================================
 
-def alpaca_request(path, params=None):
+def get_batch_bars(symbols):
 
-    response = requests.get(
-        f"{DATA_URL}{path}",
-        headers=HEADERS,
-        params=params,
-        timeout=45,
-    )
-
-    if not response.ok:
-        raise RuntimeError(
-            f"Alpaca error "
-            f"{response.status_code}: "
-            f"{response.text[:500]}"
-        )
-
-    return response.json()
-
-
-# ============================================================
-# DOWNLOAD 4-MINUTE BARS
-# ============================================================
-
-def get_bars(symbol):
+    if not symbols:
+        return {}
 
     end = datetime.now(UTC)
 
     start = (
         end -
-        timedelta(days=HISTORY_DAYS)
+        timedelta(
+            days=HISTORY_DAYS
+        )
     )
 
     params = {
-        "symbols": symbol,
+        "symbols": ",".join(symbols),
         "timeframe": TIMEFRAME,
         "start": start.isoformat(),
         "end": end.isoformat(),
@@ -215,18 +278,30 @@ def get_bars(symbol):
         "limit": 10000,
     }
 
-    all_bars = []
+    collected = {
+        symbol: []
+        for symbol in symbols
+    }
 
     page_token = None
 
     while True:
 
         if page_token:
-            params["page_token"] = page_token
 
-        result = alpaca_request(
-            "/v2/stocks/bars",
-            params
+            params[
+                "page_token"
+            ] = page_token
+
+        elif "page_token" in params:
+
+            del params[
+                "page_token"
+            ]
+
+        result = api_request(
+            f"{DATA_URL}/v2/stocks/bars",
+            params=params
         )
 
         bars_by_symbol = result.get(
@@ -234,12 +309,19 @@ def get_bars(symbol):
             {}
         )
 
-        bars = bars_by_symbol.get(
-            symbol,
-            []
-        )
+        for symbol, bars in bars_by_symbol.items():
 
-        all_bars.extend(bars)
+            if symbol not in collected:
+
+                collected[
+                    symbol
+                ] = []
+
+            collected[
+                symbol
+            ].extend(
+                bars
+            )
 
         page_token = result.get(
             "next_page_token"
@@ -248,11 +330,15 @@ def get_bars(symbol):
         if not page_token:
             break
 
-    return all_bars
+        time.sleep(
+            REQUEST_PAUSE
+        )
+
+    return collected
 
 
 # ============================================================
-# CONVERT TO DATAFRAME
+# DATAFRAME
 # ============================================================
 
 def bars_to_dataframe(bars):
@@ -260,9 +346,11 @@ def bars_to_dataframe(bars):
     if not bars:
         return pd.DataFrame()
 
-    df = pd.DataFrame(bars)
+    df = pd.DataFrame(
+        bars
+    )
 
-    needed = {
+    required = {
         "t",
         "o",
         "h",
@@ -271,7 +359,10 @@ def bars_to_dataframe(bars):
         "v",
     }
 
-    if not needed.issubset(df.columns):
+    if not required.issubset(
+        set(df.columns)
+    ):
+
         return pd.DataFrame()
 
     df = df.rename(
@@ -285,7 +376,9 @@ def bars_to_dataframe(bars):
         }
     )
 
-    df["timestamp"] = pd.to_datetime(
+    df[
+        "timestamp"
+    ] = pd.to_datetime(
         df["timestamp"],
         utc=True
     )
@@ -294,7 +387,9 @@ def bars_to_dataframe(bars):
         "timestamp"
     )
 
-    df = df.tz_convert(NY)
+    df = df.tz_convert(
+        NY
+    )
 
     for column in [
         "open",
@@ -304,7 +399,9 @@ def bars_to_dataframe(bars):
         "volume",
     ]:
 
-        df[column] = pd.to_numeric(
+        df[
+            column
+        ] = pd.to_numeric(
             df[column],
             errors="coerce"
         )
@@ -332,7 +429,9 @@ def add_indicators(df):
 
     df = df.copy()
 
-    df["ema5"] = (
+    df[
+        "ema5"
+    ] = (
         df["close"]
         .ewm(
             span=EMA_FAST,
@@ -341,7 +440,9 @@ def add_indicators(df):
         .mean()
     )
 
-    df["ema9"] = (
+    df[
+        "ema9"
+    ] = (
         df["close"]
         .ewm(
             span=EMA_SLOW,
@@ -350,7 +451,9 @@ def add_indicators(df):
         .mean()
     )
 
-    df["ema30"] = (
+    df[
+        "ema30"
+    ] = (
         df["close"]
         .ewm(
             span=EMA_TREND,
@@ -359,32 +462,32 @@ def add_indicators(df):
         .mean()
     )
 
-    typical_price = (
+    typical = (
         df["high"] +
         df["low"] +
         df["close"]
     ) / 3.0
 
-    trading_date = pd.Series(
+    dates = pd.Series(
         df.index.date,
         index=df.index
     )
 
     pv = (
-        typical_price *
+        typical *
         df["volume"]
     )
 
     cumulative_pv = (
         pv.groupby(
-            trading_date
+            dates
         ).cumsum()
     )
 
     cumulative_volume = (
         df["volume"]
         .groupby(
-            trading_date
+            dates
         )
         .cumsum()
         .replace(
@@ -393,7 +496,9 @@ def add_indicators(df):
         )
     )
 
-    df["vwap"] = (
+    df[
+        "vwap"
+    ] = (
         cumulative_pv /
         cumulative_volume
     )
@@ -402,10 +507,13 @@ def add_indicators(df):
 
 
 # ============================================================
-# EXACT PINE-STYLE BACKTEST
+# PINE-STYLE STRATEGY CALCULATION
 # ============================================================
 
-def calculate_stats(symbol, raw_df):
+def calculate_stats(
+    symbol,
+    raw_df
+):
 
     if raw_df.empty:
         return None
@@ -417,10 +525,6 @@ def calculate_stats(symbol, raw_df):
     target = target_move(
         symbol
     )
-
-    # ----------------------------------------
-    # Pine-style persistent variables
-    # ----------------------------------------
 
     in_trade = False
     long_trade = False
@@ -450,20 +554,17 @@ def calculate_stats(symbol, raw_df):
     previous_close = None
     previous_date = None
 
-    last_signal = "WAITING"
-
-    latest_timestamp = None
-
-    # ----------------------------------------
-    # Process every 4-minute candle
-    # ----------------------------------------
+    current_signal = "WAITING"
 
     for timestamp, row in df.iterrows():
 
-        latest_timestamp = timestamp
+        current_date = (
+            timestamp.date()
+        )
 
-        current_date = timestamp.date()
-        current_time = timestamp.time()
+        current_time = (
+            timestamp.time()
+        )
 
         close = float(
             row["close"]
@@ -508,44 +609,46 @@ def calculate_stats(symbol, raw_df):
             pm_low = None
 
         # ====================================
-        # PREMARKET HIGH / LOW
+        # PREMARKET
         # ====================================
 
-        in_premarket = (
+        in_pm = (
             current_time >= PREMARKET_START
             and current_time < PREMARKET_END
         )
 
-        if in_premarket:
+        if in_pm:
 
             if pm_high is None:
+
                 pm_high = high
+
             else:
+
                 pm_high = max(
                     pm_high,
                     high
                 )
 
             if pm_low is None:
+
                 pm_low = low
+
             else:
+
                 pm_low = min(
                     pm_low,
                     low
                 )
 
         # ====================================
-        # REGULAR SESSION
+        # RTH
         # ====================================
 
         in_rth = (
             current_time >= RTH_START
             and current_time < RTH_END
         )
-
-        # ====================================
-        # TREND FILTERS
-        # ====================================
 
         bull_trend = (
             ema5 > ema9
@@ -566,7 +669,7 @@ def calculate_stats(symbol, raw_df):
         )
 
         # ====================================
-        # BREAK CONDITIONS
+        # BREAKOUTS
         # ====================================
 
         long_break = False
@@ -600,14 +703,12 @@ def calculate_stats(symbol, raw_df):
 
         # ====================================
         # ENTRY
-        #
-        # Pine enters first, then checks TP /
-        # EMA9 exit on the same candle.
         # ====================================
 
         can_trade = (
             not in_trade
-            and trades_today < MAX_TRADES_PER_DAY
+            and trades_today <
+            MAX_TRADES_PER_DAY
         )
 
         long_entry = (
@@ -634,7 +735,9 @@ def calculate_stats(symbol, raw_df):
 
             trades_today += 1
 
-            last_signal = "CALL SIGNAL"
+            current_signal = (
+                "CALL SIGNAL"
+            )
 
         elif short_entry:
 
@@ -650,10 +753,12 @@ def calculate_stats(symbol, raw_df):
 
             trades_today += 1
 
-            last_signal = "PUT SIGNAL"
+            current_signal = (
+                "PUT SIGNAL"
+            )
 
         # ====================================
-        # EXIT CONDITIONS
+        # EXITS
         # ====================================
 
         if in_trade:
@@ -664,17 +769,9 @@ def calculate_stats(symbol, raw_df):
 
             if long_trade:
 
-                long_tp = (
-                    high >= target_price
-                )
+                if high >= target_price:
 
-                long_stop = (
-                    close <= ema9
-                )
-
-                if long_tp:
-
-                    profit_move = (
+                    move = (
                         target_price -
                         entry_price
                     )
@@ -686,19 +783,19 @@ def calculate_stats(symbol, raw_df):
                     call_trades += 1
 
                     total_move += (
-                        profit_move
+                        move
                     )
 
                     in_trade = False
 
-                elif long_stop:
+                elif close <= ema9:
 
-                    exit_move = (
+                    move = (
                         close -
                         entry_price
                     )
 
-                    if exit_move > 0:
+                    if move > 0:
 
                         wins += 1
                         call_wins += 1
@@ -712,7 +809,7 @@ def calculate_stats(symbol, raw_df):
                     call_trades += 1
 
                     total_move += (
-                        exit_move
+                        move
                     )
 
                     in_trade = False
@@ -723,17 +820,9 @@ def calculate_stats(symbol, raw_df):
 
             else:
 
-                short_tp = (
-                    low <= target_price
-                )
+                if low <= target_price:
 
-                short_stop = (
-                    close >= ema9
-                )
-
-                if short_tp:
-
-                    profit_move = (
+                    move = (
                         entry_price -
                         target_price
                     )
@@ -745,19 +834,19 @@ def calculate_stats(symbol, raw_df):
                     put_trades += 1
 
                     total_move += (
-                        profit_move
+                        move
                     )
 
                     in_trade = False
 
-                elif short_stop:
+                elif close >= ema9:
 
-                    exit_move = (
+                    move = (
                         entry_price -
                         close
                     )
 
-                    if exit_move > 0:
+                    if move > 0:
 
                         wins += 1
                         put_wins += 1
@@ -771,7 +860,7 @@ def calculate_stats(symbol, raw_df):
                     put_trades += 1
 
                     total_move += (
-                        exit_move
+                        move
                     )
 
                     in_trade = False
@@ -780,47 +869,47 @@ def calculate_stats(symbol, raw_df):
         previous_date = current_date
 
     # ========================================
-    # WIN RATES
+    # PERCENTAGES
     # ========================================
 
     overall_rate = (
         wins * 100.0 /
         total_trades
-        if total_trades > 0
+        if total_trades
         else 0.0
     )
 
     call_rate = (
         call_wins * 100.0 /
         call_trades
-        if call_trades > 0
+        if call_trades
         else 0.0
     )
 
     put_rate = (
         put_wins * 100.0 /
         put_trades
-        if put_trades > 0
+        if put_trades
         else 0.0
     )
 
     # ========================================
-    # 90% SIDE QUALIFICATION
-    #
-    # THIS IS THE IMPORTANT CHANGE:
-    #
-    # CALL must itself be >=90%
-    # PUT must itself be >=90%
+    # IMPORTANT:
+    # EACH SIDE MUST QUALIFY BY ITSELF
     # ========================================
 
     call_qualified = (
-        call_trades >= MIN_SIDE_TRADES
-        and call_rate >= MIN_WIN_RATE
+        call_trades >=
+        MIN_SIDE_TRADES
+        and call_rate >=
+        MIN_WIN_RATE
     )
 
     put_qualified = (
-        put_trades >= MIN_SIDE_TRADES
-        and put_rate >= MIN_WIN_RATE
+        put_trades >=
+        MIN_SIDE_TRADES
+        and put_rate >=
+        MIN_WIN_RATE
     )
 
     if (
@@ -828,23 +917,31 @@ def calculate_stats(symbol, raw_df):
         and put_qualified
     ):
 
-        qualification = "CALL + PUT"
+        qualification = (
+            "CALL + PUT"
+        )
 
     elif call_qualified:
 
-        qualification = "CALL"
+        qualification = (
+            "CALL"
+        )
 
     elif put_qualified:
 
-        qualification = "PUT"
+        qualification = (
+            "PUT"
+        )
 
     else:
 
-        qualification = "SKIP"
+        qualification = (
+            "SKIP"
+        )
 
     if in_trade:
 
-        last_signal = (
+        current_signal = (
             "CALL ACTIVE"
             if long_trade
             else "PUT ACTIVE"
@@ -885,86 +982,868 @@ def calculate_stats(symbol, raw_df):
             2
         ),
 
-        "call_qualified": call_qualified,
-        "put_qualified": put_qualified,
+        "call_qualified":
+            call_qualified,
 
-        "qualification": qualification,
+        "put_qualified":
+            put_qualified,
 
-        "signal": last_signal,
+        "qualification":
+            qualification,
 
-        "latest_bar": (
-            latest_timestamp.isoformat()
-            if latest_timestamp
-            else None
-        ),
+        "signal":
+            current_signal,
     }
 
 
 # ============================================================
-# SCAN ONE SYMBOL
+# PROCESS ONE MARKET BATCH
 # ============================================================
 
-def scan_symbol(symbol):
+def process_batch(
+    symbols
+):
 
-    logging.info(
-        "Scanning %s",
-        symbol
-    )
-
-    bars = get_bars(
-        symbol
-    )
-
-    df = bars_to_dataframe(
-        bars
-    )
-
-    if df.empty:
-
-        logging.warning(
-            "%s has no usable bars",
-            symbol
+    bars_by_symbol = (
+        get_batch_bars(
+            symbols
         )
-
-        return None
-
-    result = calculate_stats(
-        symbol,
-        df
     )
 
-    if result:
+    results = []
 
-        logging.info(
-            "%s | CALL %.1f%% | PUT %.1f%% | %s",
-            symbol,
-            result["call_rate"],
-            result["put_rate"],
-            result["qualification"],
-        )
+    for symbol in symbols:
 
-    return result
+        try:
+
+            bars = (
+                bars_by_symbol.get(
+                    symbol,
+                    []
+                )
+            )
+
+            df = (
+                bars_to_dataframe(
+                    bars
+                )
+            )
+
+            stats = (
+                calculate_stats(
+                    symbol,
+                    df
+                )
+            )
+
+            with lock:
+
+                STATE[
+                    "scanned_count"
+                ] += 1
+
+            if not stats:
+                continue
+
+            results.append(
+                stats
+            )
+
+            logging.info(
+                "%s | CALL %.1f%% | "
+                "PUT %.1f%% | %s",
+                symbol,
+                stats[
+                    "call_rate"
+                ],
+                stats[
+                    "put_rate"
+                ],
+                stats[
+                    "qualification"
+                ],
+            )
+
+        except Exception as exc:
+
+            logging.warning(
+                "%s failed: %s",
+                symbol,
+                exc
+            )
+
+    return results
 
 
 # ============================================================
-# RUN FULL WATCHLIST SCAN
+# FULL MARKET SCAN
 # ============================================================
 
-def run_scan():
+def run_full_market_scan():
 
     with lock:
 
-        STATE["status"] = "SCANNING"
-        STATE["error"] = None
+        if STATE[
+            "status"
+        ] == "SCANNING":
 
-    logging.info(
-        "===================================="
+            return
+
+        STATE[
+            "status"
+        ] = "SCANNING"
+
+        STATE[
+            "scanned_count"
+        ] = 0
+
+        STATE[
+            "qualified_count"
+        ] = 0
+
+        STATE[
+            "error"
+        ] = None
+
+        STATE[
+            "scan_started"
+        ] = datetime.now(
+            NY
+        ).isoformat()
+
+    try:
+
+        universe = (
+            get_entire_market()
+        )
+
+        with lock:
+
+            STATE[
+                "universe_count"
+            ] = len(
+                universe
+            )
+
+        all_results = []
+
+        batches = [
+
+            universe[
+                i:
+                i + BATCH_SIZE
+            ]
+
+            for i in range(
+                0,
+                len(universe),
+                BATCH_SIZE
+            )
+        ]
+
+        logging.info(
+            "Scanning %s stocks "
+            "in %s batches",
+            len(universe),
+            len(batches)
+        )
+
+        for number, batch in enumerate(
+            batches,
+            start=1
+        ):
+
+            logging.info(
+                "Batch %s/%s",
+                number,
+                len(batches)
+            )
+
+            batch_results = (
+                process_batch(
+                    batch
+                )
+            )
+
+            all_results.extend(
+                batch_results
+            )
+
+            # Best side first.
+            all_results.sort(
+                key=lambda stock:
+                    max(
+                        stock[
+                            "call_rate"
+                        ],
+                        stock[
+                            "put_rate"
+                        ],
+                    ),
+                reverse=True
+            )
+
+            qualified = [
+
+                stock
+
+                for stock
+                in all_results
+
+                if (
+                    stock[
+                        "call_qualified"
+                    ]
+                    or
+                    stock[
+                        "put_qualified"
+                    ]
+                )
+            ]
+
+            with lock:
+
+                STATE[
+                    "results"
+                ] = (
+                    all_results.copy()
+                )
+
+                STATE[
+                    "qualified"
+                ] = (
+                    qualified.copy()
+                )
+
+                STATE[
+                    "qualified_count"
+                ] = len(
+                    qualified
+                )
+
+            time.sleep(
+                REQUEST_PAUSE
+            )
+
+        now = datetime.now(
+            NY
+        )
+
+        with lock:
+
+            STATE[
+                "status"
+            ] = "READY"
+
+            STATE[
+                "last_scan"
+            ] = now.isoformat()
+
+        logging.info(
+            "FULL MARKET SCAN COMPLETE"
+        )
+
+        logging.info(
+            "Scanned: %s",
+            STATE[
+                "scanned_count"
+            ]
+        )
+
+        logging.info(
+            "90%%+ qualifying: %s",
+            STATE[
+                "qualified_count"
+            ]
+        )
+
+    except Exception as exc:
+
+        logging.exception(
+            "Full-market scan failed"
+        )
+
+        with lock:
+
+            STATE[
+                "status"
+            ] = "ERROR"
+
+            STATE[
+                "error"
+            ] = str(
+                exc
+            )
+
+
+# ============================================================
+# AUTOMATIC SCANNER LOOP
+# ============================================================
+
+def scanner_loop():
+
+    time.sleep(
+        3
     )
 
-    logging.info(
-        "Starting 90%% CALL/PUT scanner"
+    while True:
+
+        try:
+
+            run_full_market_scan()
+
+        except Exception:
+
+            logging.exception(
+                "Scanner loop error"
+            )
+
+        time.sleep(
+            SCAN_EVERY_MINUTES *
+            60
+        )
+
+
+# ============================================================
+# IPHONE WEBPAGE
+# ============================================================
+
+HTML = """
+<!doctype html>
+
+<html>
+
+<head>
+
+<meta
+name="viewport"
+content="width=device-width, initial-scale=1">
+
+<meta
+http-equiv="refresh"
+content="60">
+
+<title>
+90% Market Scanner
+</title>
+
+<style>
+
+body {
+    margin: 0;
+    padding: 14px;
+    background: #050505;
+    color: white;
+    font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        Arial,
+        sans-serif;
+}
+
+h1 {
+    font-size: 25px;
+    margin-bottom: 4px;
+}
+
+.subtitle {
+    color: #999;
+    font-size: 13px;
+    margin-bottom: 15px;
+}
+
+.summary {
+    background: #171717;
+    padding: 13px;
+    border-radius: 13px;
+    margin-bottom: 16px;
+    line-height: 1.6;
+}
+
+.stock {
+    background: #171717;
+    padding: 14px;
+    border-radius: 14px;
+    margin-bottom: 10px;
+}
+
+.top {
+    display: flex;
+    justify-content:
+        space-between;
+    align-items: center;
+}
+
+.symbol {
+    font-size: 24px;
+    font-weight: 900;
+}
+
+.direction {
+    font-size: 17px;
+    font-weight: 900;
+}
+
+.call {
+    color: #39d353;
+}
+
+.put {
+    color: #ff4d4f;
+}
+
+.both {
+    color: #ffd43b;
+}
+
+.rates {
+    display: grid;
+    grid-template-columns:
+        1fr 1fr;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.rate {
+    background: #0d0d0d;
+    padding: 10px;
+    border-radius: 10px;
+    text-align: center;
+}
+
+.label {
+    color: #999;
+    font-size: 10px;
+}
+
+.number {
+    font-size: 22px;
+    font-weight: 900;
+    margin-top: 3px;
+}
+
+.record {
+    margin-top: 10px;
+    font-size: 12px;
+    color: #aaa;
+    line-height: 1.5;
+}
+
+.status {
+    margin-top: 8px;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.empty {
+    padding: 25px;
+    border-radius: 14px;
+    background: #171717;
+    color: #999;
+    text-align: center;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>
+90% FULL MARKET SCANNER
+</h1>
+
+<div class="subtitle">
+4-minute CALL / PUT strategy
+</div>
+
+<div class="summary">
+
+<strong>Status:</strong>
+{{ status }}
+
+<br>
+
+<strong>Market symbols:</strong>
+{{ universe_count }}
+
+<br>
+
+<strong>Scanned:</strong>
+{{ scanned_count }}
+
+<br>
+
+<strong>90%+ stocks:</strong>
+{{ qualified_count }}
+
+<br>
+
+<strong>Minimum:</strong>
+{{ minimum }}%
+
+<br>
+
+<strong>Last completed scan:</strong>
+{{ last_scan or "Not completed yet" }}
+
+{% if error %}
+
+<br><br>
+
+<span class="put">
+{{ error }}
+</span>
+
+{% endif %}
+
+</div>
+
+
+{% if qualified %}
+
+{% for stock in qualified %}
+
+<div class="stock">
+
+<div class="top">
+
+<div class="symbol">
+{{ stock.symbol }}
+</div>
+
+{% if stock.qualification == "CALL" %}
+
+<div class="direction call">
+CALL
+</div>
+
+{% elif stock.qualification == "PUT" %}
+
+<div class="direction put">
+PUT
+</div>
+
+{% else %}
+
+<div class="direction both">
+CALL + PUT
+</div>
+
+{% endif %}
+
+</div>
+
+
+<div class="rates">
+
+<div class="rate">
+
+<div class="label">
+CALL WIN RATE
+</div>
+
+<div class="number
+{% if stock.call_qualified %}
+call
+{% endif %}
+">
+
+{{ stock.call_rate }}%
+
+</div>
+
+</div>
+
+
+<div class="rate">
+
+<div class="label">
+PUT WIN RATE
+</div>
+
+<div class="number
+{% if stock.put_qualified %}
+put
+{% endif %}
+">
+
+{{ stock.put_rate }}%
+
+</div>
+
+</div>
+
+</div>
+
+
+<div class="record">
+
+CALL:
+{{ stock.call_wins }}W /
+{{ stock.call_losses }}L
+—
+{{ stock.call_trades }}
+trades
+
+<br>
+
+PUT:
+{{ stock.put_wins }}W /
+{{ stock.put_losses }}L
+—
+{{ stock.put_trades }}
+trades
+
+<br>
+
+OVERALL:
+{{ stock.overall }}%
+
+</div>
+
+
+<div class="status">
+
+STATUS:
+{{ stock.signal }}
+
+</div>
+
+</div>
+
+{% endfor %}
+
+{% else %}
+
+<div class="empty">
+
+No 90%+ CALL or PUT stocks
+found yet.
+
+<br><br>
+
+If the market scan is still running,
+this page will update as batches finish.
+
+</div>
+
+{% endif %}
+
+
+</body>
+
+</html>
+"""
+
+
+# ============================================================
+# WEBSITE ROUTES
+# ============================================================
+
+@app.route("/")
+def home():
+
+    return jsonify({
+        "scanner":
+            "Full Market 90% CALL PUT Scanner",
+
+        "timeframe":
+            TIMEFRAME,
+
+        "minimum":
+            MIN_WIN_RATE,
+
+        "watchlist":
+            "/watchlist",
+
+        "api":
+            "/api/watchlist",
+
+        "rescan":
+            "/rescan",
+    })
+
+
+@app.route("/watchlist")
+def watchlist():
+
+    with lock:
+
+        snapshot = {
+            "status":
+                STATE[
+                    "status"
+                ],
+
+            "universe_count":
+                STATE[
+                    "universe_count"
+                ],
+
+            "scanned_count":
+                STATE[
+                    "scanned_count"
+                ],
+
+            "qualified_count":
+                STATE[
+                    "qualified_count"
+                ],
+
+            "qualified":
+                STATE[
+                    "qualified"
+                ].copy(),
+
+            "last_scan":
+                STATE[
+                    "last_scan"
+                ],
+
+            "error":
+                STATE[
+                    "error"
+                ],
+        }
+
+    return render_template_string(
+        HTML,
+        minimum=MIN_WIN_RATE,
+        **snapshot
     )
 
-    logging.info(
-        "Watchlist: %s",
-        WATCH
+
+@app.route("/api/watchlist")
+def api_watchlist():
+
+    with lock:
+
+        return jsonify({
+            "status":
+                STATE[
+                    "status"
+                ],
+
+            "universe_count":
+                STATE[
+                    "universe_count"
+                ],
+
+            "scanned_count":
+                STATE[
+                    "scanned_count"
+                ],
+
+            "qualified_count":
+                STATE[
+                    "qualified_count"
+                ],
+
+            "minimum_win_rate":
+                MIN_WIN_RATE,
+
+            "timeframe":
+                TIMEFRAME,
+
+            "last_scan":
+                STATE[
+                    "last_scan"
+                ],
+
+            "qualified":
+                STATE[
+                    "qualified"
+                ],
+
+            "error":
+                STATE[
+                    "error"
+                ],
+        })
+
+
+@app.route("/rescan")
+def rescan():
+
+    with lock:
+
+        already_scanning = (
+            STATE[
+                "status"
+            ] == "SCANNING"
+        )
+
+    if already_scanning:
+
+        return jsonify({
+            "status":
+                "already scanning"
+        })
+
+    thread = threading.Thread(
+        target=
+            run_full_market_scan,
+        daemon=True
+    )
+
+    thread.start()
+
+    return jsonify({
+        "status":
+            "full market scan started"
+    })
+
+
+@app.route("/health")
+def health():
+
+    return jsonify({
+        "status":
+            "healthy",
+
+        "alpaca_key_loaded":
+            bool(
+                ALPACA_API_KEY
+            ),
+
+        "alpaca_secret_loaded":
+            bool(
+                ALPACA_SECRET_KEY
+            ),
+
+        "scanner_status":
+            STATE[
+                "status"
+            ],
+    })
+
+
+# ============================================================
+# START
+# ============================================================
+
+if __name__ == "__main__":
+
+    scanner_thread = (
+        threading.Thread(
+            target=scanner_loop,
+            daemon=True
+        )
+    )
+
+    scanner_thread.start()
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000"
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        threaded=True
+    )
