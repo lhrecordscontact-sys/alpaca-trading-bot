@@ -2,7 +2,6 @@ import os
 import time
 import threading
 import logging
-from collections import deque
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 
@@ -72,8 +71,6 @@ RTH_END = dt_time(16, 0)
 
 SPY_TARGET = 1.00
 IWM_TARGET = 0.50
-
-# Same target used for all symbols except IWM.
 DEFAULT_TARGET = 1.00
 
 MAX_TRADES_PER_DAY = 2
@@ -85,8 +82,9 @@ MIN_WIN_RATE = float(
     )
 )
 
+
 # ============================================================
-# EXACT ROLLING SAMPLE
+# SEPARATE CALL / PUT ROLLING SAMPLE
 # ============================================================
 
 ROLLING_TRADES = int(
@@ -96,18 +94,20 @@ ROLLING_TRADES = int(
     )
 )
 
-# A stock CANNOT qualify unless all 64 completed trades exist.
 REQUIRE_FULL_SAMPLE = True
+
+# 58 / 64 = 90.625%
+REQUIRED_WINS = 58
 
 
 # ============================================================
-# HISTORY
+# HISTORY / BATCH SETTINGS
 # ============================================================
 
 HISTORY_DAYS = int(
     os.getenv(
         "HISTORY_DAYS",
-        "180"
+        "365"
     )
 )
 
@@ -125,10 +125,25 @@ REQUEST_PAUSE = float(
     )
 )
 
-SCAN_EVERY_MINUTES = int(
+
+# ============================================================
+# DAILY SCAN TIME
+#
+# Runs ONCE per weekday after market close.
+# Default = 4:15 PM Eastern.
+# ============================================================
+
+SCAN_HOUR_ET = int(
     os.getenv(
-        "SCAN_EVERY_MINUTES",
-        "60"
+        "SCAN_HOUR_ET",
+        "16"
+    )
+)
+
+SCAN_MINUTE_ET = int(
+    os.getenv(
+        "SCAN_MINUTE_ET",
+        "15"
     )
 )
 
@@ -140,10 +155,12 @@ SCAN_EVERY_MINUTES = int(
 lock = threading.Lock()
 
 STATE = {
-    "status": "STARTING",
+    "status": "WAITING FOR DAILY SCAN",
     "universe_count": 0,
     "scanned_count": 0,
     "qualified_count": 0,
+    "call_qualified_count": 0,
+    "put_qualified_count": 0,
     "last_scan": None,
     "scan_started": None,
     "results": [],
@@ -156,11 +173,7 @@ STATE = {
 # API REQUEST
 # ============================================================
 
-def api_request(
-    url,
-    params=None,
-    timeout=60
-):
+def api_request(url, params=None, timeout=60):
 
     response = requests.get(
         url,
@@ -170,7 +183,6 @@ def api_request(
     )
 
     if not response.ok:
-
         raise RuntimeError(
             f"{response.status_code}: "
             f"{response.text[:500]}"
@@ -180,7 +192,7 @@ def api_request(
 
 
 # ============================================================
-# GET ENTIRE ACTIVE U.S. STOCK UNIVERSE
+# ENTIRE ACTIVE U.S. STOCK UNIVERSE
 # ============================================================
 
 def get_entire_market():
@@ -220,9 +232,7 @@ def get_entire_market():
         if "/" in symbol:
             continue
 
-        symbols.append(
-            symbol
-        )
+        symbols.append(symbol)
 
     symbols = sorted(
         set(symbols)
@@ -290,16 +300,10 @@ def get_batch_bars(symbols):
     while True:
 
         if page_token:
-
-            params[
-                "page_token"
-            ] = page_token
+            params["page_token"] = page_token
 
         elif "page_token" in params:
-
-            del params[
-                "page_token"
-            ]
+            del params["page_token"]
 
         result = api_request(
             f"{DATA_URL}/v2/stocks/bars",
@@ -314,14 +318,9 @@ def get_batch_bars(symbols):
         for symbol, bars in bars_by_symbol.items():
 
             if symbol not in collected:
+                collected[symbol] = []
 
-                collected[
-                    symbol
-                ] = []
-
-            collected[
-                symbol
-            ].extend(
+            collected[symbol].extend(
                 bars
             )
 
@@ -364,7 +363,6 @@ def bars_to_dataframe(bars):
     if not required.issubset(
         set(df.columns)
     ):
-
         return pd.DataFrame()
 
     df = df.rename(
@@ -378,9 +376,7 @@ def bars_to_dataframe(bars):
         }
     )
 
-    df[
-        "timestamp"
-    ] = pd.to_datetime(
+    df["timestamp"] = pd.to_datetime(
         df["timestamp"],
         utc=True
     )
@@ -401,9 +397,7 @@ def bars_to_dataframe(bars):
         "volume",
     ]:
 
-        df[
-            column
-        ] = pd.to_numeric(
+        df[column] = pd.to_numeric(
             df[column],
             errors="coerce"
         )
@@ -540,7 +534,19 @@ def make_trade_record(
 
 
 # ============================================================
-# EXACT ROLLING-64 STRATEGY CALCULATION
+# STRATEGY CALCULATION
+#
+# IMPORTANT:
+#
+# CALLS AND PUTS ARE NOW MEASURED SEPARATELY.
+#
+# CALL qualification:
+# last 64 CALL trades only
+#
+# PUT qualification:
+# last 64 PUT trades only
+#
+# Combined win rate DOES NOT control qualification.
 # ============================================================
 
 def calculate_stats(
@@ -576,23 +582,12 @@ def calculate_stats(
 
     current_signal = "WAITING"
 
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # Stores completed trades chronologically.
-    # Qualification will ONLY use the final 64.
-    # --------------------------------------------------------
-
     completed_trades = []
 
     for timestamp, row in df.iterrows():
 
-        current_date = (
-            timestamp.date()
-        )
-
-        current_time = (
-            timestamp.time()
-        )
+        current_date = timestamp.date()
+        current_time = timestamp.time()
 
         close = float(
             row["close"]
@@ -650,22 +645,16 @@ def calculate_stats(
         if in_pm:
 
             if pm_high is None:
-
                 pm_high = high
-
             else:
-
                 pm_high = max(
                     pm_high,
                     high
                 )
 
             if pm_low is None:
-
                 pm_low = low
-
             else:
-
                 pm_low = min(
                     pm_low,
                     low
@@ -702,50 +691,40 @@ def calculate_stats(
         )
 
         # ====================================================
-        # FIRST HANDLE EXISTING TRADE
-        #
-        # This is intentionally BEFORE new entries.
-        # It prevents a new entry from "winning" from a high/low
-        # that already occurred earlier inside the entry candle.
+        # MANAGE EXISTING TRADE FIRST
         # ====================================================
 
         if in_trade:
 
             if long_trade:
 
-                # CALL TARGET
                 if high >= target_price:
 
-                    trade = make_trade_record(
-                        side="CALL",
-                        entry_price=entry_price,
-                        exit_price=target_price,
-                        entry_time=entry_timestamp,
-                        exit_time=timestamp,
-                        reason="TARGET"
-                    )
-
                     completed_trades.append(
-                        trade
+                        make_trade_record(
+                            side="CALL",
+                            entry_price=entry_price,
+                            exit_price=target_price,
+                            entry_time=entry_timestamp,
+                            exit_time=timestamp,
+                            reason="TARGET"
+                        )
                     )
 
                     in_trade = False
                     current_signal = "WAITING"
 
-                # CALL EMA9 EXIT
                 elif close <= ema9:
 
-                    trade = make_trade_record(
-                        side="CALL",
-                        entry_price=entry_price,
-                        exit_price=close,
-                        entry_time=entry_timestamp,
-                        exit_time=timestamp,
-                        reason="EMA9"
-                    )
-
                     completed_trades.append(
-                        trade
+                        make_trade_record(
+                            side="CALL",
+                            entry_price=entry_price,
+                            exit_price=close,
+                            entry_time=entry_timestamp,
+                            exit_time=timestamp,
+                            reason="EMA9"
+                        )
                     )
 
                     in_trade = False
@@ -753,46 +732,40 @@ def calculate_stats(
 
             else:
 
-                # PUT TARGET
                 if low <= target_price:
 
-                    trade = make_trade_record(
-                        side="PUT",
-                        entry_price=entry_price,
-                        exit_price=target_price,
-                        entry_time=entry_timestamp,
-                        exit_time=timestamp,
-                        reason="TARGET"
-                    )
-
                     completed_trades.append(
-                        trade
+                        make_trade_record(
+                            side="PUT",
+                            entry_price=entry_price,
+                            exit_price=target_price,
+                            entry_time=entry_timestamp,
+                            exit_time=timestamp,
+                            reason="TARGET"
+                        )
                     )
 
                     in_trade = False
                     current_signal = "WAITING"
 
-                # PUT EMA9 EXIT
                 elif close >= ema9:
 
-                    trade = make_trade_record(
-                        side="PUT",
-                        entry_price=entry_price,
-                        exit_price=close,
-                        entry_time=entry_timestamp,
-                        exit_time=timestamp,
-                        reason="EMA9"
-                    )
-
                     completed_trades.append(
-                        trade
+                        make_trade_record(
+                            side="PUT",
+                            entry_price=entry_price,
+                            exit_price=close,
+                            entry_time=entry_timestamp,
+                            exit_time=timestamp,
+                            reason="EMA9"
+                        )
                     )
 
                     in_trade = False
                     current_signal = "WAITING"
 
         # ====================================================
-        # BREAKOUTS
+        # BREAKOUT CONDITIONS
         # ====================================================
 
         long_break = False
@@ -898,78 +871,48 @@ def calculate_stats(
         previous_date = current_date
 
     # ========================================================
-    # TOTAL HISTORICAL COMPLETED TRADES
+    # ALL HISTORICAL CALL / PUT TRADES
     # ========================================================
+
+    historical_calls = [
+        trade
+        for trade in completed_trades
+        if trade["side"] == "CALL"
+    ]
+
+    historical_puts = [
+        trade
+        for trade in completed_trades
+        if trade["side"] == "PUT"
+    ]
 
     historical_trade_count = len(
         completed_trades
     )
 
+    historical_call_count = len(
+        historical_calls
+    )
+
+    historical_put_count = len(
+        historical_puts
+    )
+
     # ========================================================
-    # EXACT LAST 64 COMPLETED TRADES
+    # EXACT LAST 64 CALL TRADES
     # ========================================================
 
-    rolling = completed_trades[
+    rolling_calls = historical_calls[
         -ROLLING_TRADES:
-    ]
-
-    rolling_count = len(
-        rolling
-    )
-
-    full_sample = (
-        rolling_count ==
-        ROLLING_TRADES
-    )
-
-    rolling_wins = sum(
-        1
-        for trade in rolling
-        if trade["win"]
-    )
-
-    rolling_losses = (
-        rolling_count -
-        rolling_wins
-    )
-
-    if rolling_count:
-
-        rolling_win_rate = (
-            rolling_wins *
-            100.0 /
-            rolling_count
-        )
-
-    else:
-
-        rolling_win_rate = 0.0
-
-    # ========================================================
-    # ROLLING CALL / PUT BREAKDOWN
-    #
-    # These are informational only.
-    # Qualification is based on the SAME combined rolling 64.
-    # ========================================================
-
-    rolling_calls = [
-        trade
-        for trade in rolling
-        if trade["side"] == "CALL"
-    ]
-
-    rolling_puts = [
-        trade
-        for trade in rolling
-        if trade["side"] == "PUT"
     ]
 
     call_trades = len(
         rolling_calls
     )
 
-    put_trades = len(
-        rolling_puts
+    call_full_sample = (
+        call_trades ==
+        ROLLING_TRADES
     )
 
     call_wins = sum(
@@ -978,20 +921,9 @@ def calculate_stats(
         if trade["win"]
     )
 
-    put_wins = sum(
-        1
-        for trade in rolling_puts
-        if trade["win"]
-    )
-
     call_losses = (
         call_trades -
         call_wins
-    )
-
-    put_losses = (
-        put_trades -
-        put_wins
     )
 
     call_rate = (
@@ -1000,6 +932,34 @@ def calculate_stats(
         call_trades
         if call_trades
         else 0.0
+    )
+
+    # ========================================================
+    # EXACT LAST 64 PUT TRADES
+    # ========================================================
+
+    rolling_puts = historical_puts[
+        -ROLLING_TRADES:
+    ]
+
+    put_trades = len(
+        rolling_puts
+    )
+
+    put_full_sample = (
+        put_trades ==
+        ROLLING_TRADES
+    )
+
+    put_wins = sum(
+        1
+        for trade in rolling_puts
+        if trade["win"]
+    )
+
+    put_losses = (
+        put_trades -
+        put_wins
     )
 
     put_rate = (
@@ -1011,87 +971,84 @@ def calculate_stats(
     )
 
     # ========================================================
-    # EXACT QUALIFICATION RULE
-    #
-    # 1. Must have FULL 64 completed trades
-    # 2. Only LAST 64 are measured
-    # 3. Rolling-64 win rate must be >= 90%
+    # SEPARATE 90% QUALIFICATION
     # ========================================================
-
-    qualified = (
-        full_sample
-        and
-        rolling_win_rate >= MIN_WIN_RATE
-    )
-
-    # ========================================================
-    # DIRECTION
-    #
-    # The 90% qualification comes from the combined rolling 64.
-    # Direction tells the bot which side has performed better.
-    # ========================================================
-
-    if qualified:
-
-        if (
-            call_trades > 0
-            and
-            put_trades > 0
-        ):
-
-            if call_rate > put_rate:
-
-                qualification = "CALL"
-
-            elif put_rate > call_rate:
-
-                qualification = "PUT"
-
-            else:
-
-                qualification = "CALL + PUT"
-
-        elif call_trades > 0:
-
-            qualification = "CALL"
-
-        elif put_trades > 0:
-
-            qualification = "PUT"
-
-        else:
-
-            qualification = "SKIP"
-
-    else:
-
-        qualification = "SKIP"
 
     call_qualified = (
-        qualified
+        call_full_sample
         and
-        qualification in (
-            "CALL",
-            "CALL + PUT"
-        )
+        call_wins >= REQUIRED_WINS
+        and
+        call_rate >= MIN_WIN_RATE
     )
 
     put_qualified = (
-        qualified
+        put_full_sample
         and
-        qualification in (
-            "PUT",
+        put_wins >= REQUIRED_WINS
+        and
+        put_rate >= MIN_WIN_RATE
+    )
+
+    qualified = (
+        call_qualified
+        or
+        put_qualified
+    )
+
+    if (
+        call_qualified
+        and
+        put_qualified
+    ):
+
+        qualification = (
             "CALL + PUT"
         )
+
+    elif call_qualified:
+
+        qualification = (
+            "CALL"
+        )
+
+    elif put_qualified:
+
+        qualification = (
+            "PUT"
+        )
+
+    else:
+
+        qualification = (
+            "SKIP"
+        )
+
+    # ========================================================
+    # DISPLAY / SORT RATE
+    # ========================================================
+
+    best_rate = max(
+        call_rate
+        if call_full_sample
+        else 0.0,
+        put_rate
+        if put_full_sample
+        else 0.0
     )
 
     # ========================================================
-    # NET MOVE FROM ROLLING 64
+    # NET MOVE
     # ========================================================
 
-    total_move = sum(
+    call_net_move = sum(
         trade["move"]
-        for trade in rolling
+        for trade in rolling_calls
+    )
+
+    put_net_move = sum(
+        trade["move"]
+        for trade in rolling_puts
     )
 
     # ========================================================
@@ -1106,62 +1063,30 @@ def calculate_stats(
             else "PUT ACTIVE"
         )
 
-    # ========================================================
-    # REQUIRED WINS FOR 90% OVER 64
-    #
-    # 58 / 64 = 90.625%
-    # ========================================================
-
-    required_wins = 58
-
     return {
 
         "symbol": symbol,
 
         # ------------------------------------
-        # EXACT ROLLING 64
+        # BEST QUALIFYING RATE
         # ------------------------------------
 
         "overall": round(
-            rolling_win_rate,
+            best_rate,
             1
         ),
 
         "rolling_win_rate": round(
-            rolling_win_rate,
+            best_rate,
             1
         ),
 
-        "rolling_trades": rolling_count,
-
-        "sample_required": ROLLING_TRADES,
-
-        "full_sample": full_sample,
-
-        "wins": rolling_wins,
-
-        "losses": rolling_losses,
-
-        "total_trades": rolling_count,
-
-        "historical_trade_count":
-            historical_trade_count,
-
-        "required_wins":
-            required_wins,
-
         # ------------------------------------
-        # CALL / PUT BREAKDOWN INSIDE
-        # THE SAME LAST 64
+        # CALL
         # ------------------------------------
 
         "call_rate": round(
             call_rate,
-            1
-        ),
-
-        "put_rate": round(
-            put_rate,
             1
         ),
 
@@ -1174,6 +1099,29 @@ def calculate_stats(
         "call_trades":
             call_trades,
 
+        "call_full_sample":
+            call_full_sample,
+
+        "call_qualified":
+            call_qualified,
+
+        "historical_call_count":
+            historical_call_count,
+
+        "call_net_move": round(
+            call_net_move,
+            2
+        ),
+
+        # ------------------------------------
+        # PUT
+        # ------------------------------------
+
+        "put_rate": round(
+            put_rate,
+            1
+        ),
+
         "put_wins":
             put_wins,
 
@@ -1183,6 +1131,33 @@ def calculate_stats(
         "put_trades":
             put_trades,
 
+        "put_full_sample":
+            put_full_sample,
+
+        "put_qualified":
+            put_qualified,
+
+        "historical_put_count":
+            historical_put_count,
+
+        "put_net_move": round(
+            put_net_move,
+            2
+        ),
+
+        # ------------------------------------
+        # TOTAL HISTORY
+        # ------------------------------------
+
+        "historical_trade_count":
+            historical_trade_count,
+
+        "sample_required":
+            ROLLING_TRADES,
+
+        "required_wins":
+            REQUIRED_WINS,
+
         # ------------------------------------
         # RESULT
         # ------------------------------------
@@ -1190,19 +1165,8 @@ def calculate_stats(
         "qualified":
             qualified,
 
-        "call_qualified":
-            call_qualified,
-
-        "put_qualified":
-            put_qualified,
-
         "qualification":
             qualification,
-
-        "net_move": round(
-            total_move,
-            2
-        ),
 
         "signal":
             current_signal,
@@ -1263,19 +1227,20 @@ def process_batch(
             )
 
             logging.info(
-                "%s | ROLLING %s/%s | "
-                "%.1f%% | %s",
+                "%s | CALL %s/64 %.1f%% %s | "
+                "PUT %s/64 %.1f%% %s | %s",
                 symbol,
-                stats[
-                    "rolling_trades"
-                ],
-                ROLLING_TRADES,
-                stats[
-                    "rolling_win_rate"
-                ],
-                stats[
-                    "qualification"
-                ],
+                stats["call_trades"],
+                stats["call_rate"],
+                "QUALIFIED"
+                if stats["call_qualified"]
+                else "SKIP",
+                stats["put_trades"],
+                stats["put_rate"],
+                "QUALIFIED"
+                if stats["put_qualified"]
+                else "SKIP",
+                stats["qualification"],
             )
 
         except Exception as exc:
@@ -1313,6 +1278,14 @@ def run_full_market_scan():
 
         STATE[
             "qualified_count"
+        ] = 0
+
+        STATE[
+            "call_qualified_count"
+        ] = 0
+
+        STATE[
+            "put_qualified_count"
         ] = 0
 
         STATE[
@@ -1382,52 +1355,62 @@ def run_full_market_scan():
                 batch_results
             )
 
-            # Highest true rolling-64 rate first.
             all_results.sort(
                 key=lambda stock: (
-                    stock[
-                        "full_sample"
-                    ],
-                    stock[
-                        "rolling_win_rate"
-                    ],
-                    stock[
-                        "wins"
-                    ]
+                    stock["qualified"],
+                    stock["rolling_win_rate"],
+                    max(
+                        stock["call_wins"],
+                        stock["put_wins"]
+                    )
                 ),
                 reverse=True
             )
 
             qualified = [
-
                 stock
+                for stock in all_results
+                if stock["qualified"]
+            ]
 
-                for stock
-                in all_results
+            call_qualified = [
+                stock
+                for stock in all_results
+                if stock["call_qualified"]
+            ]
 
-                if stock[
-                    "qualified"
-                ]
+            put_qualified = [
+                stock
+                for stock in all_results
+                if stock["put_qualified"]
             ]
 
             with lock:
 
                 STATE[
                     "results"
-                ] = (
-                    all_results.copy()
-                )
+                ] = all_results.copy()
 
                 STATE[
                     "qualified"
-                ] = (
-                    qualified.copy()
-                )
+                ] = qualified.copy()
 
                 STATE[
                     "qualified_count"
                 ] = len(
                     qualified
+                )
+
+                STATE[
+                    "call_qualified_count"
+                ] = len(
+                    call_qualified
+                )
+
+                STATE[
+                    "put_qualified_count"
+                ] = len(
+                    put_qualified
                 )
 
             time.sleep(
@@ -1449,21 +1432,27 @@ def run_full_market_scan():
             ] = now.isoformat()
 
         logging.info(
-            "FULL MARKET SCAN COMPLETE"
+            "FULL MARKET DAILY SCAN COMPLETE"
         )
 
         logging.info(
             "Scanned: %s",
-            STATE[
-                "scanned_count"
-            ]
+            STATE["scanned_count"]
         )
 
         logging.info(
-            "90%%+ ROLLING-64 qualifying: %s",
-            STATE[
-                "qualified_count"
-            ]
+            "90%%+ CALL qualified: %s",
+            STATE["call_qualified_count"]
+        )
+
+        logging.info(
+            "90%%+ PUT qualified: %s",
+            STATE["put_qualified_count"]
+        )
+
+        logging.info(
+            "Total qualifying symbols: %s",
+            STATE["qualified_count"]
         )
 
     except Exception as exc:
@@ -1486,20 +1475,108 @@ def run_full_market_scan():
 
 
 # ============================================================
-# AUTOMATIC SCANNER LOOP
+# NEXT WEEKDAY SCAN TIME
+# ============================================================
+
+def get_next_scan_time():
+
+    now = datetime.now(
+        NY
+    )
+
+    target = now.replace(
+        hour=SCAN_HOUR_ET,
+        minute=SCAN_MINUTE_ET,
+        second=0,
+        microsecond=0
+    )
+
+    # If today's time has already passed,
+    # move to tomorrow.
+    if target <= now:
+
+        target += timedelta(
+            days=1
+        )
+
+    # Skip Saturday / Sunday.
+    while target.weekday() >= 5:
+
+        target += timedelta(
+            days=1
+        )
+
+    return target
+
+
+# ============================================================
+# AUTOMATIC DAILY SCANNER LOOP
+#
+# ONE scan each weekday at 4:15 PM ET.
+#
+# It does NOT immediately scan every time Render restarts.
+# It does NOT scan every hour.
 # ============================================================
 
 def scanner_loop():
-
-    time.sleep(
-        3
-    )
 
     while True:
 
         try:
 
+            next_scan = (
+                get_next_scan_time()
+            )
+
+            with lock:
+
+                if STATE[
+                    "status"
+                ] != "SCANNING":
+
+                    STATE[
+                        "status"
+                    ] = "WAITING FOR DAILY SCAN"
+
+            logging.info(
+                "Next automatic scan: %s",
+                next_scan.isoformat()
+            )
+
+            while True:
+
+                now = datetime.now(
+                    NY
+                )
+
+                seconds_remaining = (
+                    next_scan -
+                    now
+                ).total_seconds()
+
+                if seconds_remaining <= 0:
+                    break
+
+                time.sleep(
+                    min(
+                        60,
+                        max(
+                            1,
+                            seconds_remaining
+                        )
+                    )
+                )
+
+            logging.info(
+                "Starting scheduled after-close scan..."
+            )
+
             run_full_market_scan()
+
+            # Prevent duplicate run on same minute.
+            time.sleep(
+                90
+            )
 
         except Exception:
 
@@ -1507,10 +1584,9 @@ def scanner_loop():
                 "Scanner loop error"
             )
 
-        time.sleep(
-            SCAN_EVERY_MINUTES *
-            60
-        )
+            time.sleep(
+                60
+            )
 
 
 # ============================================================
@@ -1533,7 +1609,7 @@ http-equiv="refresh"
 content="60">
 
 <title>
-90% Rolling 64 Market Scanner
+90% CALL / PUT Scanner
 </title>
 
 <style>
@@ -1551,7 +1627,7 @@ body {
 }
 
 h1 {
-    font-size: 24px;
+    font-size: 23px;
     margin-bottom: 4px;
 }
 
@@ -1566,7 +1642,7 @@ h1 {
     padding: 13px;
     border-radius: 13px;
     margin-bottom: 16px;
-    line-height: 1.6;
+    line-height: 1.7;
 }
 
 .stock {
@@ -1578,13 +1654,12 @@ h1 {
 
 .top {
     display: flex;
-    justify-content:
-        space-between;
+    justify-content: space-between;
     align-items: center;
 }
 
 .symbol {
-    font-size: 24px;
+    font-size: 25px;
     font-weight: 900;
 }
 
@@ -1605,36 +1680,16 @@ h1 {
     color: #ffd43b;
 }
 
-.winrate {
-    margin-top: 12px;
-    background: #0d0d0d;
-    padding: 13px;
-    border-radius: 12px;
-    text-align: center;
-}
-
-.big {
-    font-size: 31px;
-    font-weight: 900;
-    color: #39d353;
-}
-
-.small {
-    color: #999;
-    font-size: 11px;
-}
-
 .rates {
     display: grid;
-    grid-template-columns:
-        1fr 1fr;
+    grid-template-columns: 1fr 1fr;
     gap: 8px;
-    margin-top: 10px;
+    margin-top: 12px;
 }
 
 .rate {
     background: #0d0d0d;
-    padding: 10px;
+    padding: 12px;
     border-radius: 10px;
     text-align: center;
 }
@@ -1645,9 +1700,22 @@ h1 {
 }
 
 .number {
-    font-size: 20px;
+    font-size: 27px;
     font-weight: 900;
     margin-top: 3px;
+}
+
+.small {
+    color: #999;
+    font-size: 11px;
+}
+
+.good {
+    color: #39d353;
+}
+
+.bad {
+    color: #777;
 }
 
 .record {
@@ -1658,7 +1726,7 @@ h1 {
 }
 
 .status {
-    margin-top: 8px;
+    margin-top: 9px;
     font-size: 12px;
     font-weight: 700;
 }
@@ -1678,11 +1746,11 @@ h1 {
 <body>
 
 <h1>
-90% ROLLING-64 MARKET SCANNER
+90% CALL / PUT MARKET SCANNER
 </h1>
 
 <div class="subtitle">
-4-minute strategy • EXACT last 64 completed trades
+Separate last 64 CALL trades and last 64 PUT trades
 </div>
 
 <div class="summary">
@@ -1702,23 +1770,42 @@ h1 {
 
 <br>
 
-<strong>90%+ qualified:</strong>
+<strong>Total qualifying stocks:</strong>
 {{ qualified_count }}
 
 <br>
 
-<strong>Required sample:</strong>
-{{ sample_size }} completed trades
+<span class="call">
+<strong>90%+ CALL stocks:</strong>
+{{ call_qualified_count }}
+</span>
 
 <br>
 
-<strong>Minimum rate:</strong>
-{{ minimum }}%
+<span class="put">
+<strong>90%+ PUT stocks:</strong>
+{{ put_qualified_count }}
+</span>
 
 <br>
 
-<strong>Minimum wins:</strong>
+<strong>Required CALL sample:</strong>
+64 CALL trades
+
+<br>
+
+<strong>Required PUT sample:</strong>
+64 PUT trades
+
+<br>
+
+<strong>Required wins:</strong>
 58 / 64
+
+<br>
+
+<strong>Automatic scan:</strong>
+4:15 PM ET weekdays
 
 <br>
 
@@ -1753,41 +1840,22 @@ h1 {
 {% if stock.qualification == "CALL" %}
 
 <div class="direction call">
-CALL
+90% CALL
 </div>
 
 {% elif stock.qualification == "PUT" %}
 
 <div class="direction put">
-PUT
+90% PUT
 </div>
 
 {% else %}
 
 <div class="direction both">
-CALL + PUT
+90% CALL + PUT
 </div>
 
 {% endif %}
-
-</div>
-
-
-<div class="winrate">
-
-<div class="small">
-EXACT LAST 64 WIN RATE
-</div>
-
-<div class="big">
-{{ stock.rolling_win_rate }}%
-</div>
-
-<div class="small">
-{{ stock.wins }} wins /
-{{ stock.losses }} losses /
-{{ stock.rolling_trades }} trades
-</div>
 
 </div>
 
@@ -1797,16 +1865,26 @@ EXACT LAST 64 WIN RATE
 <div class="rate">
 
 <div class="label">
-CALLS INSIDE LAST 64
+LAST 64 CALL TRADES
 </div>
 
-<div class="number">
+<div
+class="number
+{% if stock.call_qualified %}
+good
+{% else %}
+bad
+{% endif %}"
+>
+
 {{ stock.call_rate }}%
+
 </div>
 
 <div class="small">
 {{ stock.call_wins }}W /
-{{ stock.call_losses }}L
+{{ stock.call_losses }}L /
+{{ stock.call_trades }}/64
 </div>
 
 </div>
@@ -1815,16 +1893,26 @@ CALLS INSIDE LAST 64
 <div class="rate">
 
 <div class="label">
-PUTS INSIDE LAST 64
+LAST 64 PUT TRADES
 </div>
 
-<div class="number">
+<div
+class="number
+{% if stock.put_qualified %}
+good
+{% else %}
+bad
+{% endif %}"
+>
+
 {{ stock.put_rate }}%
+
 </div>
 
 <div class="small">
 {{ stock.put_wins }}W /
-{{ stock.put_losses }}L
+{{ stock.put_losses }}L /
+{{ stock.put_trades }}/64
 </div>
 
 </div>
@@ -1834,25 +1922,30 @@ PUTS INSIDE LAST 64
 
 <div class="record">
 
-ROLLING SAMPLE:
-{{ stock.rolling_trades }} / 64
+Historical CALL trades:
+{{ stock.historical_call_count }}
 
 <br>
 
-HISTORICAL COMPLETED TRADES FOUND:
-{{ stock.historical_trade_count }}
+Historical PUT trades:
+{{ stock.historical_put_count }}
 
 <br>
 
-NET UNDERLYING MOVE:
-{{ stock.net_move }}
+CALL net move:
+{{ stock.call_net_move }}
+
+<br>
+
+PUT net move:
+{{ stock.put_net_move }}
 
 </div>
 
 
 <div class="status">
 
-STATUS:
+CURRENT STATUS:
 {{ stock.signal }}
 
 </div>
@@ -1865,13 +1958,16 @@ STATUS:
 
 <div class="empty">
 
-No stocks currently meet the
-90% rolling-64 requirement.
+No CALL or PUT stocks currently meet
+the separate 90% / 64-trade requirement.
 
 <br><br>
 
-A stock must have a FULL
-64 completed trades before it can appear here.
+A CALL must have 64 CALL trades.
+
+<br>
+
+A PUT must have 64 PUT trades.
 
 </div>
 
@@ -1894,7 +1990,7 @@ def home():
     return jsonify({
 
         "scanner":
-            "Exact Rolling 64 Full Market Scanner",
+            "Separate 90% CALL / PUT Full Market Scanner",
 
         "timeframe":
             TIMEFRAME,
@@ -1902,11 +1998,14 @@ def home():
         "minimum_win_rate":
             MIN_WIN_RATE,
 
-        "required_completed_trades":
+        "required_completed_trades_per_side":
             ROLLING_TRADES,
 
-        "required_wins_for_90_percent":
-            58,
+        "required_wins":
+            REQUIRED_WINS,
+
+        "automatic_scan_time":
+            f"{SCAN_HOUR_ET:02d}:{SCAN_MINUTE_ET:02d} ET",
 
         "watchlist":
             "/watchlist",
@@ -1914,7 +2013,10 @@ def home():
         "api":
             "/api/watchlist",
 
-        "rescan":
+        "all_results":
+            "/api/all",
+
+        "manual_rescan":
             "/rescan",
     })
 
@@ -1927,45 +2029,35 @@ def watchlist():
         snapshot = {
 
             "status":
-                STATE[
-                    "status"
-                ],
+                STATE["status"],
 
             "universe_count":
-                STATE[
-                    "universe_count"
-                ],
+                STATE["universe_count"],
 
             "scanned_count":
-                STATE[
-                    "scanned_count"
-                ],
+                STATE["scanned_count"],
 
             "qualified_count":
-                STATE[
-                    "qualified_count"
-                ],
+                STATE["qualified_count"],
+
+            "call_qualified_count":
+                STATE["call_qualified_count"],
+
+            "put_qualified_count":
+                STATE["put_qualified_count"],
 
             "qualified":
-                STATE[
-                    "qualified"
-                ].copy(),
+                STATE["qualified"].copy(),
 
             "last_scan":
-                STATE[
-                    "last_scan"
-                ],
+                STATE["last_scan"],
 
             "error":
-                STATE[
-                    "error"
-                ],
+                STATE["error"],
         }
 
     return render_template_string(
         HTML,
-        minimum=MIN_WIN_RATE,
-        sample_size=ROLLING_TRADES,
         **snapshot
     )
 
@@ -1978,51 +2070,46 @@ def api_watchlist():
         return jsonify({
 
             "status":
-                STATE[
-                    "status"
-                ],
+                STATE["status"],
 
             "universe_count":
-                STATE[
-                    "universe_count"
-                ],
+                STATE["universe_count"],
 
             "scanned_count":
-                STATE[
-                    "scanned_count"
-                ],
+                STATE["scanned_count"],
 
             "qualified_count":
-                STATE[
-                    "qualified_count"
-                ],
+                STATE["qualified_count"],
+
+            "call_qualified_count":
+                STATE["call_qualified_count"],
+
+            "put_qualified_count":
+                STATE["put_qualified_count"],
 
             "minimum_win_rate":
                 MIN_WIN_RATE,
 
-            "required_sample":
+            "required_sample_per_side":
                 ROLLING_TRADES,
 
             "required_wins":
-                58,
+                REQUIRED_WINS,
 
             "timeframe":
                 TIMEFRAME,
 
+            "automatic_scan_time_et":
+                f"{SCAN_HOUR_ET:02d}:{SCAN_MINUTE_ET:02d}",
+
             "last_scan":
-                STATE[
-                    "last_scan"
-                ],
+                STATE["last_scan"],
 
             "qualified":
-                STATE[
-                    "qualified"
-                ],
+                STATE["qualified"],
 
             "error":
-                STATE[
-                    "error"
-                ],
+                STATE["error"],
         })
 
 
@@ -2034,23 +2121,24 @@ def api_all():
         return jsonify({
 
             "status":
-                STATE[
-                    "status"
-                ],
+                STATE["status"],
 
             "results":
-                STATE[
-                    "results"
-                ],
+                STATE["results"],
 
             "count":
                 len(
-                    STATE[
-                        "results"
-                    ]
+                    STATE["results"]
                 ),
         })
 
+
+# ============================================================
+# OPTIONAL MANUAL RESCAN
+#
+# Automatic scanning remains once daily.
+# This route lets YOU manually force a scan if needed.
+# ============================================================
 
 @app.route("/rescan")
 def rescan():
@@ -2071,8 +2159,7 @@ def rescan():
         })
 
     thread = threading.Thread(
-        target=
-            run_full_market_scan,
+        target=run_full_market_scan,
         daemon=True
     )
 
@@ -2080,7 +2167,7 @@ def rescan():
 
     return jsonify({
         "status":
-            "full market rolling-64 scan started"
+            "manual full-market scan started"
     })
 
 
@@ -2103,15 +2190,19 @@ def health():
             ),
 
         "scanner_status":
-            STATE[
-                "status"
-            ],
+            STATE["status"],
 
-        "rolling_sample":
+        "rolling_sample_per_side":
             ROLLING_TRADES,
+
+        "required_wins":
+            REQUIRED_WINS,
 
         "minimum_win_rate":
             MIN_WIN_RATE,
+
+        "daily_scan_time_et":
+            f"{SCAN_HOUR_ET:02d}:{SCAN_MINUTE_ET:02d}",
     })
 
 
