@@ -62,6 +62,11 @@ SCANNER_URL = os.getenv(
     "https://nine0-percent-scanner.onrender.com/api/watchlist"
 ).strip()
 
+DISCORD_WEBHOOK_URL = os.getenv(
+    "DISCORD_WEBHOOK_URL",
+    ""
+).strip()
+
 HEADERS = {
     "APCA-API-KEY-ID": ALPACA_API_KEY,
     "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
@@ -172,33 +177,15 @@ STATE = {
     "removed": [],
     "last_ai_decision": None,
     "last_order": None,
+    "last_discord_alert": None,
     "errors": [],
     "auto_trade": AUTO_TRADE,
+    "discord_enabled": bool(DISCORD_WEBHOOK_URL),
     "market_entry_start": "09:30 ET",
     "last_entry": "14:45 ET",
     "force_exit": "15:15 ET",
 }
 
-
-# ============================================================
-# SCANNER MEMORY
-# ============================================================
-
-#
-# This is the important part.
-#
-# The bot remembers every stock returned by the scanner here.
-#
-# Example:
-#
-# WATCH_MEMORY["AAPL"] = {
-#     "symbol": "AAPL",
-#     "direction": "CALL",
-#     "score": 86.2,
-#     "status": "WAITING_CONFIRMATION",
-#     ...
-# }
-#
 
 WATCH_MEMORY = {}
 
@@ -210,28 +197,100 @@ daily_trade_counts = {}
 
 managed = {}
 
+discord_seen = set()
+
+
+# ============================================================
+# DISCORD
+# ============================================================
+
+def discord_notify(
+    message,
+    dedupe_key=None
+):
+
+    if not DISCORD_WEBHOOK_URL:
+        return
+
+    if dedupe_key:
+
+        if dedupe_key in discord_seen:
+            return
+
+        discord_seen.add(
+            dedupe_key
+        )
+
+    try:
+
+        response = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={
+                "content": message
+            },
+            timeout=10,
+        )
+
+        if not response.ok:
+
+            logging.warning(
+                "Discord alert failed: %s %s",
+                response.status_code,
+                response.text[:200],
+            )
+
+        else:
+
+            with lock:
+
+                STATE[
+                    "last_discord_alert"
+                ] = {
+                    "time": datetime.now(
+                        NY
+                    ).isoformat(),
+                    "message": message,
+                }
+
+    except Exception as error:
+
+        logging.warning(
+            "Discord alert error: %s",
+            error
+        )
+
 
 # ============================================================
 # ERRORS
 # ============================================================
 
-def log_error(error):
+def log_error(
+    error
+):
 
-    msg = str(error)[:500]
+    msg = str(
+        error
+    )[:500]
 
-    logging.error(msg)
+    logging.error(
+        msg
+    )
 
     with lock:
 
-        STATE["errors"] = (
-            STATE["errors"]
+        STATE[
+            "errors"
+        ] = (
+            STATE[
+                "errors"
+            ]
             +
             [msg]
         )[-20:]
 
 
 # ============================================================
-# ALPACA API REQUEST
+# ALPACA REQUEST
 # ============================================================
 
 def req(
@@ -267,7 +326,7 @@ def req(
 
 
 # ============================================================
-# SCANNER RESPONSE
+# SCANNER
 # ============================================================
 
 def load_scanner():
@@ -282,27 +341,34 @@ def load_scanner():
     payload = response.json()
 
     items = (
-        payload.get("watchlist")
+        payload.get(
+            "watchlist"
+        )
         or
-        payload.get("qualified")
+        payload.get(
+            "qualified"
+        )
         or
         []
     )
 
     scanner_id = (
-        payload.get("last_scan")
+        payload.get(
+            "last_scan"
+        )
         or
-        payload.get("scanned_at")
+        payload.get(
+            "scanned_at"
+        )
         or
-        payload.get("scan_time")
+        payload.get(
+            "scan_time"
+        )
         or
-        payload.get("timestamp")
+        payload.get(
+            "timestamp"
+        )
     )
-
-    #
-    # If scanner does not provide a scan timestamp,
-    # create a stable signature from its current results.
-    #
 
     if not scanner_id:
 
@@ -318,19 +384,28 @@ def load_scanner():
                             ""
                         )
                     ).upper(),
+
                     str(
                         item.get(
                             "direction",
                             ""
                         )
                     ).upper(),
-                    item.get("score"),
-                    item.get("trigger"),
+
+                    item.get(
+                        "score"
+                    ),
+
+                    item.get(
+                        "trigger"
+                    ),
                 )
             )
 
         scanner_id = json.dumps(
-            sorted(signature),
+            sorted(
+                signature
+            ),
             default=str
         )
 
@@ -373,11 +448,21 @@ def load_scanner():
             if score < MIN_SETUP_SCORE:
                 continue
 
-            candidate = dict(item)
+            candidate = dict(
+                item
+            )
 
-            candidate["symbol"] = symbol
-            candidate["direction"] = direction
-            candidate["score"] = score
+            candidate[
+                "symbol"
+            ] = symbol
+
+            candidate[
+                "direction"
+            ] = direction
+
+            candidate[
+                "score"
+            ] = score
 
             qualified.append(
                 candidate
@@ -391,20 +476,33 @@ def load_scanner():
             )
 
     return {
-        "scanner_id": str(scanner_id),
-        "last_scan": (
-            payload.get("last_scan")
-            or
-            payload.get("scanned_at")
-            or
-            payload.get("scan_time")
-        ),
-        "qualified": qualified,
+        "scanner_id":
+            str(
+                scanner_id
+            ),
+
+        "last_scan":
+            (
+                payload.get(
+                    "last_scan"
+                )
+                or
+                payload.get(
+                    "scanned_at"
+                )
+                or
+                payload.get(
+                    "scan_time"
+                )
+            ),
+
+        "qualified":
+            qualified,
     }
 
 
 # ============================================================
-# SYNCHRONIZE SCANNER MEMORY
+# SCANNER MEMORY
 # ============================================================
 
 def sync_scanner_memory():
@@ -425,24 +523,15 @@ def sync_scanner_memory():
         "last_scan"
     )
 
-    #
-    # SAME SCAN:
-    #
-    # Do not destroy/rebuild memory every 20 seconds.
-    # Continue watching the previously remembered setups.
-    #
-
     if scanner_id == LAST_SCANNER_ID:
 
         return list(
             WATCH_MEMORY.values()
         )
 
-    #
-    # NEW SCAN:
-    #
-
-    LAST_SCANNER_ID = scanner_id
+    LAST_SCANNER_ID = (
+        scanner_id
+    )
 
     now = datetime.now(
         NY
@@ -462,6 +551,13 @@ def sync_scanner_memory():
             "direction"
         ]
 
+        score = float(
+            item.get(
+                "score",
+                0
+            )
+        )
+
         key = (
             symbol,
             direction
@@ -474,10 +570,6 @@ def sync_scanner_memory():
         old = WATCH_MEMORY.get(
             symbol
         )
-
-        #
-        # Brand-new scanner setup
-        #
 
         if (
             old is None
@@ -494,36 +586,53 @@ def sync_scanner_memory():
             ] = {
                 **item,
 
-                "status": "WATCHING",
+                "status":
+                    "WATCHING",
 
-                "first_seen": now,
+                "first_seen":
+                    now,
 
-                "last_seen": now,
+                "last_seen":
+                    now,
 
-                "scanner_scan": scanner_last_scan,
+                "scanner_scan":
+                    scanner_last_scan,
 
-                "confirmation_bar": None,
+                "confirmation_bar":
+                    None,
 
-                "ai_checked": False,
+                "ai_checked":
+                    False,
 
-                "entered": False,
+                "entered":
+                    False,
             }
 
             logging.info(
                 "SCANNER ADD | %s %s | score %.2f",
                 symbol,
                 direction,
-                float(
-                    item.get(
-                        "score",
-                        0
-                    )
-                ),
+                score,
             )
 
-        #
-        # Existing setup still qualifies
-        #
+            discord_notify(
+                (
+                    f"🔎 **QUALIFIED SETUP**\n"
+                    f"**{symbol} {direction}**\n"
+                    f"Score: **{score:.1f}/100**\n"
+                    f"Price: {item.get('price')}\n"
+                    f"Trigger: {item.get('trigger')}\n"
+                    f"Target: {item.get('target')}\n"
+                    f"Status: {item.get('status')}\n"
+                    f"Bot is now watching for confirmation."
+                ),
+                dedupe_key=(
+                    "qualified",
+                    scanner_id,
+                    symbol,
+                    direction,
+                )
+            )
 
         else:
 
@@ -544,19 +653,12 @@ def sync_scanner_memory():
                 "scanner_scan"
             ] = scanner_last_scan
 
-            #
-            # Don't reset ENTERED setups.
-            #
-
             if previous_status != "ENTERED":
 
                 old[
                     "status"
                 ] = previous_status
 
-    #
-    # REMOVE setups that disappeared from the NEW scanner scan.
-    #
 
     for symbol in list(
         WATCH_MEMORY.keys()
@@ -578,11 +680,6 @@ def sync_scanner_memory():
             if item.get(
                 "status"
             ) == "ENTERED":
-
-                #
-                # Position management remains active even
-                # if the scanner removes the stock.
-                #
 
                 continue
 
@@ -608,7 +705,7 @@ def sync_scanner_memory():
             )
 
             logging.info(
-                "SCANNER REMOVE | %s | no longer qualified",
+                "SCANNER REMOVE | %s",
                 symbol
             )
 
@@ -655,13 +752,26 @@ def get_bars(
     )
 
     params = {
-        "timeframe": TIMEFRAME,
-        "start": start.isoformat(),
-        "end": now.isoformat(),
-        "adjustment": "raw",
-        "feed": DATA_FEED,
-        "sort": "asc",
-        "limit": 1000,
+        "timeframe":
+            TIMEFRAME,
+
+        "start":
+            start.isoformat(),
+
+        "end":
+            now.isoformat(),
+
+        "adjustment":
+            "raw",
+
+        "feed":
+            DATA_FEED,
+
+        "sort":
+            "asc",
+
+        "limit":
+            1000,
     }
 
     result = req(
@@ -700,7 +810,9 @@ def get_bars(
     df[
         "timestamp"
     ] = pd.to_datetime(
-        df["timestamp"],
+        df[
+            "timestamp"
+        ],
         utc=True,
     )
 
@@ -726,15 +838,13 @@ def get_bars(
         df[
             column
         ] = pd.to_numeric(
-            df[column],
+            df[
+                column
+            ],
             errors="coerce",
         )
 
     df = df.dropna()
-
-    #
-    # Only use completed 4-minute candles.
-    #
 
     now_et = datetime.now(
         NY
@@ -757,14 +867,18 @@ def get_bars(
 # INDICATORS
 # ============================================================
 
-def enrich(df):
+def enrich(
+    df
+):
 
     data = df.copy()
 
     data[
         "ema5"
     ] = (
-        data["close"]
+        data[
+            "close"
+        ]
         .ewm(
             span=EMA_FAST,
             adjust=False
@@ -775,7 +889,9 @@ def enrich(df):
     data[
         "ema9"
     ] = (
-        data["close"]
+        data[
+            "close"
+        ]
         .ewm(
             span=EMA_SLOW,
             adjust=False
@@ -786,7 +902,9 @@ def enrich(df):
     data[
         "ema30"
     ] = (
-        data["close"]
+        data[
+            "close"
+        ]
         .ewm(
             span=EMA_TREND,
             adjust=False
@@ -808,7 +926,9 @@ def enrich(df):
     ) / 3
 
     cumulative_volume = (
-        data["volume"]
+        data[
+            "volume"
+        ]
         .groupby(
             dates
         )
@@ -825,7 +945,9 @@ def enrich(df):
         (
             typical_price
             *
-            data["volume"]
+            data[
+                "volume"
+            ]
         )
         .groupby(
             dates
@@ -838,7 +960,9 @@ def enrich(df):
     data[
         "vol20"
     ] = (
-        data["volume"]
+        data[
+            "volume"
+        ]
         .rolling(
             20,
             min_periods=5
@@ -850,7 +974,7 @@ def enrich(df):
 
 
 # ============================================================
-# HARD ENTRY CONFIRMATION
+# HARD CONFIRMATION
 # ============================================================
 
 def hard_confirmation(
@@ -858,7 +982,10 @@ def hard_confirmation(
     df
 ):
 
-    if len(df) < 30:
+    if len(
+        df
+    ) < 30:
+
         return None
 
     data = enrich(
@@ -885,6 +1012,7 @@ def hard_confirmation(
     )
 
     if trigger_raw is None:
+
         return None
 
     try:
@@ -905,21 +1033,29 @@ def hard_confirmation(
 
     bullish_candle = (
         float(
-            last["close"]
+            last[
+                "close"
+            ]
         )
         >
         float(
-            last["open"]
+            last[
+                "open"
+            ]
         )
     )
 
     bearish_candle = (
         float(
-            last["close"]
+            last[
+                "close"
+            ]
         )
         <
         float(
-            last["open"]
+            last[
+                "open"
+            ]
         )
     )
 
@@ -976,6 +1112,7 @@ def hard_confirmation(
         )
 
     if not confirmed:
+
         return None
 
     candles = []
@@ -985,34 +1122,55 @@ def hard_confirmation(
     ).iterrows():
 
         candles.append({
-            "time": timestamp.isoformat(),
-            "o": round(
-                float(
-                    row["open"]
+            "time":
+                timestamp.isoformat(),
+
+            "o":
+                round(
+                    float(
+                        row[
+                            "open"
+                        ]
+                    ),
+                    4
                 ),
-                4
-            ),
-            "h": round(
-                float(
-                    row["high"]
+
+            "h":
+                round(
+                    float(
+                        row[
+                            "high"
+                        ]
+                    ),
+                    4
                 ),
-                4
-            ),
-            "l": round(
-                float(
-                    row["low"]
+
+            "l":
+                round(
+                    float(
+                        row[
+                            "low"
+                        ]
+                    ),
+                    4
                 ),
-                4
-            ),
-            "c": round(
-                float(
-                    row["close"]
+
+            "c":
+                round(
+                    float(
+                        row[
+                            "close"
+                        ]
+                    ),
+                    4
                 ),
-                4
-            ),
-            "v": int(
-                row["volume"]
-            ),
+
+            "v":
+                int(
+                    row[
+                        "volume"
+                    ]
+                ),
         })
 
     if (
@@ -1028,9 +1186,13 @@ def hard_confirmation(
     ):
 
         volume_ratio = (
-            last["volume"]
+            last[
+                "volume"
+            ]
             /
-            last["vol20"]
+            last[
+                "vol20"
+            ]
         )
 
     else:
@@ -1038,95 +1200,116 @@ def hard_confirmation(
         volume_ratio = 1.0
 
     return {
-        "symbol": item[
-            "symbol"
-        ],
+        "symbol":
+            item[
+                "symbol"
+            ],
 
-        "direction": direction,
+        "direction":
+            direction,
 
-        "scanner_score": item.get(
-            "score"
-        ),
-
-        "scanner_status": item.get(
-            "status"
-        ),
-
-        "trigger": trigger,
-
-        "support": item.get(
-            "support"
-        ),
-
-        "resistance": item.get(
-            "resistance"
-        ),
-
-        "scanner_target": item.get(
-            "target"
-        ),
-
-        "price": round(
-            price,
-            4
-        ),
-
-        "ema5": round(
-            float(
-                last["ema5"]
+        "scanner_score":
+            item.get(
+                "score"
             ),
-            4
-        ),
 
-        "ema9": round(
-            float(
-                last["ema9"]
+        "scanner_status":
+            item.get(
+                "status"
             ),
-            4
-        ),
 
-        "ema30": round(
-            float(
-                last["ema30"]
+        "trigger":
+            trigger,
+
+        "support":
+            item.get(
+                "support"
             ),
-            4
-        ),
 
-        "vwap": round(
-            float(
-                last["vwap"]
+        "resistance":
+            item.get(
+                "resistance"
             ),
-            4
-        ),
 
-        "volume_ratio": round(
-            float(
-                volume_ratio
+        "scanner_target":
+            item.get(
+                "target"
             ),
-            2
-        ),
 
-        "bar_time": (
-            data.index[-1]
-            .isoformat()
-        ),
+        "price":
+            round(
+                price,
+                4
+            ),
 
-        "previous_close": round(
-            float(
-                previous[
-                    "close"
+        "ema5":
+            round(
+                float(
+                    last[
+                        "ema5"
+                    ]
+                ),
+                4
+            ),
+
+        "ema9":
+            round(
+                float(
+                    last[
+                        "ema9"
+                    ]
+                ),
+                4
+            ),
+
+        "ema30":
+            round(
+                float(
+                    last[
+                        "ema30"
+                    ]
+                ),
+                4
+            ),
+
+        "vwap":
+            round(
+                float(
+                    last[
+                        "vwap"
+                    ]
+                ),
+                4
+            ),
+
+        "volume_ratio":
+            round(
+                float(
+                    volume_ratio
+                ),
+                2
+            ),
+
+        "bar_time":
+            (
+                data.index[
+                    -1
                 ]
+                .isoformat()
             ),
-            4
-        ),
 
-        "recent_candles": candles,
+        "previous_close":
+            round(
+                float(
+                    previous[
+                        "close"
+                    ]
+                ),
+                4
+            ),
 
-        "rule_note": (
-            "Scanner qualification alone is NOT an entry. "
-            "Latest completed 4-minute candle must confirm "
-            "direction, trigger, EMA structure and VWAP."
-        ),
+        "recent_candles":
+            candles,
     }
 
 
@@ -1145,6 +1328,7 @@ def positions():
         result,
         list
     ):
+
         return result
 
     return []
@@ -1166,6 +1350,7 @@ def underlying_open(
         if position_symbol.startswith(
             symbol
         ):
+
             return True
 
     return False
@@ -1197,11 +1382,20 @@ def option_contract(
     )
 
     params = {
-        "underlying_symbols": symbol,
-        "status": "active",
-        "type": option_type,
-        "expiration_date": today,
-        "limit": 1000,
+        "underlying_symbols":
+            symbol,
+
+        "status":
+            "active",
+
+        "type":
+            option_type,
+
+        "expiration_date":
+            today,
+
+        "limit":
+            1000,
     }
 
     data = req(
@@ -1223,6 +1417,7 @@ def option_contract(
     )
 
     if not contracts:
+
         return None
 
     def strike(
@@ -1253,11 +1448,13 @@ def option_contract(
     ]
 
     if not contracts:
+
         return None
 
     return min(
         contracts,
-        key=lambda contract: abs(
+        key=lambda contract:
+        abs(
             strike(
                 contract
             )
@@ -1268,7 +1465,7 @@ def option_contract(
 
 
 # ============================================================
-# SUBMIT OPTION ORDER
+# SUBMIT ORDER
 # ============================================================
 
 def submit_option(
@@ -1310,47 +1507,63 @@ def submit_option(
         "POST",
         "/v2/orders",
         data={
-            "symbol": option_symbol,
-            "qty": str(
-                max(
-                    1,
-                    OPTION_QTY
-                )
-            ),
-            "side": "buy",
-            "type": "market",
-            "time_in_force": "day",
+            "symbol":
+                option_symbol,
+
+            "qty":
+                str(
+                    max(
+                        1,
+                        OPTION_QTY
+                    )
+                ),
+
+            "side":
+                "buy",
+
+            "type":
+                "market",
+
+            "time_in_force":
+                "day",
         }
     )
 
     managed[
         option_symbol
     ] = {
-        "underlying": symbol,
+        "underlying":
+            symbol,
 
-        "direction": direction,
+        "direction":
+            direction,
 
-        "trigger": (
+        "trigger":
+            (
+                decision.get(
+                    "entry"
+                )
+                or
+                price
+            ),
+
+        "stop":
             decision.get(
-                "entry"
-            )
-            or
-            price
-        ),
+                "stop"
+            ),
 
-        "stop": decision.get(
-            "stop"
-        ),
+        "tp1":
+            decision.get(
+                "tp1"
+            ),
 
-        "tp1": decision.get(
-            "tp1"
-        ),
+        "tp2":
+            decision.get(
+                "tp2"
+            ),
 
-        "tp2": decision.get(
-            "tp2"
-        ),
-
-        "tp1_done": False,
+        "tp1_done":
+            False,
     }
 
     if symbol in WATCH_MEMORY:
@@ -1382,6 +1595,20 @@ def submit_option(
         option_symbol,
     )
 
+    discord_notify(
+        (
+            f"🚀 **PAPER TRADE ENTERED**\n"
+            f"**{symbol} {direction}**\n"
+            f"Contract: `{option_symbol}`\n"
+            f"Qty: **{OPTION_QTY}**\n"
+            f"Underlying: **{price:.2f}**\n"
+            f"Entry level: {decision.get('entry')}\n"
+            f"Stop: {decision.get('stop')}\n"
+            f"TP1: {decision.get('tp1')}\n"
+            f"TP2: {decision.get('tp2')}"
+        )
+    )
+
     return order
 
 
@@ -1405,19 +1632,28 @@ def close_option(
         "POST",
         "/v2/orders",
         data={
-            "symbol": option_symbol,
-            "qty": str(
-                qty
-            ),
-            "side": "sell",
-            "type": "market",
-            "time_in_force": "day",
+            "symbol":
+                option_symbol,
+
+            "qty":
+                str(
+                    qty
+                ),
+
+            "side":
+                "sell",
+
+            "type":
+                "market",
+
+            "time_in_force":
+                "day",
         }
     )
 
 
 # ============================================================
-# LATEST UNDERLYING PRICE
+# LATEST STOCK PRICE
 # ============================================================
 
 def latest_stock_price(
@@ -1430,6 +1666,7 @@ def latest_stock_price(
     )
 
     if df.empty:
+
         return None
 
     return float(
@@ -1482,13 +1719,21 @@ def manage_positions():
 
             if now.time() >= FORCE_EXIT:
 
-                logging.info(
-                    "FORCE EXIT | %s",
+                close_option(
                     option_symbol
                 )
 
-                close_option(
-                    option_symbol
+                discord_notify(
+                    (
+                        f"⏰ **FORCE EXIT**\n"
+                        f"{info['underlying']} {info['direction']}\n"
+                        f"Contract: `{option_symbol}`\n"
+                        f"Reason: 3:15 PM ET cutoff."
+                    ),
+                    dedupe_key=(
+                        "force_exit",
+                        option_symbol
+                    )
                 )
 
                 managed.pop(
@@ -1505,6 +1750,7 @@ def manage_positions():
             )
 
             if price is None:
+
                 continue
 
             qty = max(
@@ -1604,14 +1850,22 @@ def manage_positions():
 
             if stop_hit:
 
-                logging.info(
-                    "STOP HIT | %s | underlying %.2f",
-                    option_symbol,
-                    price,
-                )
-
                 close_option(
                     option_symbol
+                )
+
+                discord_notify(
+                    (
+                        f"🛑 **STOP HIT**\n"
+                        f"{info['underlying']} {direction}\n"
+                        f"Contract: `{option_symbol}`\n"
+                        f"Underlying price: **{price:.2f}**\n"
+                        f"Stop level: **{stop}**"
+                    ),
+                    dedupe_key=(
+                        "stop",
+                        option_symbol
+                    )
                 )
 
                 managed.pop(
@@ -1621,14 +1875,23 @@ def manage_positions():
 
             elif tp2_hit:
 
-                logging.info(
-                    "TP2 HIT | %s | underlying %.2f",
-                    option_symbol,
-                    price,
-                )
-
                 close_option(
                     option_symbol
+                )
+
+                discord_notify(
+                    (
+                        f"🏆 **TP2 HIT**\n"
+                        f"{info['underlying']} {direction}\n"
+                        f"Contract: `{option_symbol}`\n"
+                        f"Underlying: **{price:.2f}**\n"
+                        f"TP2: **{tp2}**\n"
+                        f"Remaining position closed."
+                    ),
+                    dedupe_key=(
+                        "tp2",
+                        option_symbol
+                    )
                 )
 
                 managed.pop(
@@ -1643,12 +1906,6 @@ def manage_positions():
                     "tp1_done"
                 ]
             ):
-
-                logging.info(
-                    "TP1 HIT | %s | underlying %.2f",
-                    option_symbol,
-                    price,
-                )
 
                 if qty > 1:
 
@@ -1670,6 +1927,22 @@ def manage_positions():
                     "tp1_done"
                 ] = True
 
+                discord_notify(
+                    (
+                        f"💰 **TP1 HIT**\n"
+                        f"{info['underlying']} {direction}\n"
+                        f"Contract: `{option_symbol}`\n"
+                        f"Underlying: **{price:.2f}**\n"
+                        f"TP1: **{tp1}**\n"
+                        f"Contracts sold: **{sell_qty}**\n"
+                        f"Contracts before sale: **{qty}**"
+                    ),
+                    dedupe_key=(
+                        "tp1",
+                        option_symbol
+                    )
+                )
+
                 if sell_qty >= qty:
 
                     managed.pop(
@@ -1685,7 +1958,7 @@ def manage_positions():
 
 
 # ============================================================
-# CLEAN OLD DAILY COUNTS
+# CLEAN DAILY COUNTS
 # ============================================================
 
 def clean_daily_counts():
@@ -1709,7 +1982,7 @@ def clean_daily_counts():
 
 
 # ============================================================
-# MAIN BOT CYCLE
+# MAIN CYCLE
 # ============================================================
 
 def cycle():
@@ -1720,18 +1993,7 @@ def cycle():
 
     clean_daily_counts()
 
-    #
-    # Always manage existing positions.
-    #
-
     manage_positions()
-
-    #
-    # Always synchronize scanner memory.
-    #
-    # This lets the bot remember the scan even though
-    # the bot itself loops every 20 seconds.
-    #
 
     watch = sync_scanner_memory()
 
@@ -1749,12 +2011,6 @@ def cycle():
             WATCH_MEMORY.values()
         )
 
-    #
-    # Premarket:
-    # remember scanner setups,
-    # but do NOT enter.
-    #
-
     if now.time() < RTH_START:
 
         with lock:
@@ -1764,18 +2020,7 @@ def cycle():
                 last_cycle=now.isoformat(),
             )
 
-        logging.info(
-            "PREMARKET | Remembering %s scanner candidates",
-            len(
-                watch
-            )
-        )
-
         return
-
-    #
-    # No new entries after cutoff.
-    #
 
     if now.time() >= LAST_ENTRY:
 
@@ -1790,20 +2035,10 @@ def cycle():
 
     new_trades = 0
 
-    logging.info(
-        "BOT MEMORY | %s active candidates",
-        len(
-            watch
-        )
-    )
-
-    #
-    # Rank highest scanner score first.
-    #
-
     watch = sorted(
         watch,
-        key=lambda x: float(
+        key=lambda x:
+        float(
             x.get(
                 "score",
                 0
@@ -1819,6 +2054,7 @@ def cycle():
             >=
             MAX_NEW_TRADES_PER_CYCLE
         ):
+
             break
 
         symbol = str(
@@ -1836,6 +2072,7 @@ def cycle():
         ).upper()
 
         if not symbol:
+
             continue
 
         memory = WATCH_MEMORY.get(
@@ -1843,16 +2080,14 @@ def cycle():
         )
 
         if not memory:
+
             continue
 
         if memory.get(
             "status"
         ) == "ENTERED":
-            continue
 
-        #
-        # Position limit.
-        #
+            continue
 
         current_positions = positions()
 
@@ -1863,6 +2098,7 @@ def cycle():
             >=
             MAX_OPEN_POSITIONS
         ):
+
             break
 
         keyday = (
@@ -1894,10 +2130,6 @@ def cycle():
             ] = "ENTERED"
 
             continue
-
-        #
-        # Waiting for completed 4-minute confirmation.
-        #
 
         memory[
             "status"
@@ -1936,9 +2168,27 @@ def cycle():
             "bar_time"
         ]
 
-        #
-        # Prevent AI from evaluating the same closed candle twice.
-        #
+        discord_notify(
+            (
+                f"✅ **4-MIN CONFIRMATION**\n"
+                f"**{symbol} {direction}**\n"
+                f"Price: **{setup['price']}**\n"
+                f"Trigger: **{setup['trigger']}**\n"
+                f"EMA5: {setup['ema5']}\n"
+                f"EMA9: {setup['ema9']}\n"
+                f"EMA30: {setup['ema30']}\n"
+                f"VWAP: {setup['vwap']}\n"
+                f"Sending setup to AI..."
+            ),
+            dedupe_key=(
+                "confirmation",
+                symbol,
+                direction,
+                setup[
+                    "bar_time"
+                ],
+            )
+        )
 
         ai_key = (
             symbol,
@@ -1959,10 +2209,6 @@ def cycle():
         memory[
             "status"
         ] = "AI_REVIEW"
-
-        #
-        # AI confirmation.
-        #
 
         try:
 
@@ -1999,34 +2245,37 @@ def cycle():
             STATE[
                 "last_ai_decision"
             ] = {
-                "setup": setup,
-                "decision": decision,
-                "time": now.isoformat(),
+                "setup":
+                    setup,
+
+                "decision":
+                    decision,
+
+                "time":
+                    now.isoformat(),
             }
 
-        logging.info(
-            "AI %s %s -> %s %.2f | %s",
-            symbol,
-            direction,
-            decision.get(
-                "decision"
+        discord_notify(
+            (
+                f"🤖 **AI DECISION**\n"
+                f"**{symbol} {direction}**\n"
+                f"Decision: **{decision.get('decision')}**\n"
+                f"Confidence: **{float(decision.get('confidence', 0)) * 100:.1f}%**\n"
+                f"Entry: {decision.get('entry')}\n"
+                f"Stop: {decision.get('stop')}\n"
+                f"TP1: {decision.get('tp1')}\n"
+                f"TP2: {decision.get('tp2')}\n"
+                f"Reason: {decision.get('reason')}"
             ),
-            float(
-                decision.get(
-                    "confidence",
-                    0
-                )
-                or
-                0
-            ),
-            decision.get(
-                "reason"
-            ),
+            dedupe_key=(
+                "ai",
+                symbol,
+                direction,
+                setup[
+                    "bar_time"
+                ],
+            )
         )
-
-        #
-        # AI must specifically return ENTER.
-        #
 
         if (
             str(
@@ -2049,42 +2298,25 @@ def cycle():
             "status"
         ] = "ENTRY_APPROVED"
 
-        #
-        # Safety switch.
-        #
-
         if not AUTO_TRADE:
-
-            logging.info(
-                "ENTRY APPROVED BUT SKIPPED | "
-                "%s %s | AUTO_TRADE=false",
-                symbol,
-                direction,
-            )
 
             memory[
                 "status"
             ] = "APPROVED_NO_AUTOTRADE"
 
-            continue
-
-        #
-        # Final safety check:
-        # stock must STILL be in scanner memory.
-        #
-
-        if symbol not in WATCH_MEMORY:
-
-            logging.info(
-                "ENTRY CANCELLED | %s removed from scanner",
-                symbol
+            discord_notify(
+                (
+                    f"⚠️ **ENTRY APPROVED — NOT SENT**\n"
+                    f"{symbol} {direction}\n"
+                    f"AUTO_TRADE=false"
+                )
             )
 
             continue
 
-        #
-        # Place paper option order.
-        #
+        if symbol not in WATCH_MEMORY:
+
+            continue
 
         try:
 
@@ -2105,6 +2337,14 @@ def cycle():
 
             log_error(
                 f"order {symbol}: {error}"
+            )
+
+            discord_notify(
+                (
+                    f"❌ **ORDER ERROR**\n"
+                    f"{symbol} {direction}\n"
+                    f"{str(error)[:300]}"
+                )
             )
 
             continue
@@ -2152,9 +2392,32 @@ def cycle():
 
 def loop():
 
+    startup_alert_sent = False
+
     while True:
 
         try:
+
+            if not startup_alert_sent:
+
+                discord_notify(
+                    (
+                        f"🟢 **ALPACA PAPER BOT ONLINE**\n"
+                        f"Auto trade: **{AUTO_TRADE}**\n"
+                        f"Minimum score: **{MIN_SETUP_SCORE}**\n"
+                        f"Option qty: **{OPTION_QTY}**\n"
+                        f"Entry window: 9:30 AM–2:45 PM ET\n"
+                        f"Force exit: 3:15 PM ET"
+                    ),
+                    dedupe_key=(
+                        "startup",
+                        datetime.now(
+                            NY
+                        ).date().isoformat()
+                    )
+                )
+
+                startup_alert_sent = True
 
             cycle()
 
@@ -2187,15 +2450,20 @@ def home():
 def watching():
 
     return jsonify({
-        "count": len(
-            WATCH_MEMORY
-        ),
-        "scanner_last_scan": STATE.get(
-            "scanner_last_scan"
-        ),
-        "watching": list(
-            WATCH_MEMORY.values()
-        ),
+        "count":
+            len(
+                WATCH_MEMORY
+            ),
+
+        "scanner_last_scan":
+            STATE.get(
+                "scanner_last_scan"
+            ),
+
+        "watching":
+            list(
+                WATCH_MEMORY.values()
+            ),
     })
 
 
@@ -2203,11 +2471,16 @@ def watching():
 def memory():
 
     return jsonify({
-        "scanner_id": LAST_SCANNER_ID,
-        "count": len(
-            WATCH_MEMORY
-        ),
-        "symbols": WATCH_MEMORY,
+        "scanner_id":
+            LAST_SCANNER_ID,
+
+        "count":
+            len(
+                WATCH_MEMORY
+            ),
+
+        "symbols":
+            WATCH_MEMORY,
     })
 
 
@@ -2215,24 +2488,77 @@ def memory():
 def health():
 
     return jsonify({
+        "ok":
+            True,
+
+        "status":
+            STATE[
+                "status"
+            ],
+
+        "auto_trade":
+            AUTO_TRADE,
+
+        "discord_enabled":
+            bool(
+                DISCORD_WEBHOOK_URL
+            ),
+
+        "last_cycle":
+            STATE[
+                "last_cycle"
+            ],
+
+        "scanner_last_scan":
+            STATE.get(
+                "scanner_last_scan"
+            ),
+
+        "watching_count":
+            len(
+                WATCH_MEMORY
+            ),
+
+        "market_entry_start":
+            "09:30 ET",
+
+        "last_entry":
+            "14:45 ET",
+
+        "force_exit":
+            "15:15 ET",
+
+        "paper_trading":
+            True,
+    })
+
+
+# ============================================================
+# TEST DISCORD
+# ============================================================
+
+@app.get("/test-discord")
+def test_discord():
+
+    if not DISCORD_WEBHOOK_URL:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                "DISCORD_WEBHOOK_URL missing"
+        }), 400
+
+    discord_notify(
+        (
+            "🔔 **TEST ALERT**\n"
+            "Your Alpaca trading bot is connected to Discord."
+        )
+    )
+
+    return jsonify({
         "ok": True,
-        "status": STATE[
-            "status"
-        ],
-        "auto_trade": AUTO_TRADE,
-        "last_cycle": STATE[
-            "last_cycle"
-        ],
-        "scanner_last_scan": STATE.get(
-            "scanner_last_scan"
-        ),
-        "watching_count": len(
-            WATCH_MEMORY
-        ),
-        "market_entry_start": "09:30 ET",
-        "last_entry": "14:45 ET",
-        "force_exit": "15:15 ET",
-        "paper_trading": True,
+        "message":
+            "Discord test alert sent."
     })
 
 
@@ -2254,6 +2580,7 @@ if __name__ == "__main__":
 
     app.run(
         host="0.0.0.0",
+
         port=int(
             os.getenv(
                 "PORT",
