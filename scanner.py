@@ -1,7 +1,4 @@
-import os
-import time
-import threading
-import logging
+import os, time, math, threading, logging
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 
@@ -9,2428 +6,298 @@ import requests
 import pandas as pd
 from flask import Flask, jsonify, render_template_string
 
-
-# ============================================================
-# APP / LOGGING
-# ============================================================
-
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+NY = ZoneInfo('America/New_York')
+UTC = ZoneInfo('UTC')
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+ALPACA_API_KEY = os.getenv('ALPACA_API_KEY', '').strip()
+ALPACA_SECRET_KEY = os.getenv('ALPACA_SECRET_KEY', '').strip()
+TRADING_URL = 'https://paper-api.alpaca.markets'
+DATA_URL = 'https://data.alpaca.markets'
+DATA_FEED = os.getenv('DATA_FEED', 'iex').strip().lower()
+HEADERS = {'APCA-API-KEY-ID': ALPACA_API_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET_KEY}
 
-NY = ZoneInfo("America/New_York")
-UTC = ZoneInfo("UTC")
+TIMEFRAME = '4Min'
+EMA_FAST, EMA_SLOW, EMA_TREND = 5, 9, 30
+PREMARKET_START, PREMARKET_END = dt_time(4, 0), dt_time(9, 30)
+RTH_START, RTH_END = dt_time(9, 30), dt_time(16, 0)
 
+MIN_PRICE = float(os.getenv('MIN_PRICE', '5'))
+MIN_DOLLAR_VOLUME = float(os.getenv('MIN_DOLLAR_VOLUME', '5000000'))
+MAX_LIVE_UNIVERSE = int(os.getenv('MAX_LIVE_UNIVERSE', '250'))
+WATCHLIST_SIZE = int(os.getenv('WATCHLIST_SIZE', '10'))
+MIN_SETUP_SCORE = float(os.getenv('MIN_SETUP_SCORE', '70'))
+SCAN_SECONDS = int(os.getenv('SCAN_SECONDS', '240'))
+SNAPSHOT_BATCH = int(os.getenv('SNAPSHOT_BATCH', '200'))
+BAR_BATCH = int(os.getenv('BAR_BATCH', '50'))
+LEVEL_LOOKBACK = int(os.getenv('LEVEL_LOOKBACK', '90'))
 
-# ============================================================
-# ALPACA
-# ============================================================
-
-ALPACA_API_KEY = os.getenv(
-    "ALPACA_API_KEY",
-    ""
-).strip()
-
-ALPACA_SECRET_KEY = os.getenv(
-    "ALPACA_SECRET_KEY",
-    ""
-).strip()
-
-TRADING_URL = "https://paper-api.alpaca.markets"
-DATA_URL = "https://data.alpaca.markets"
-
-DATA_FEED = os.getenv(
-    "DATA_FEED",
-    "iex"
-).strip().lower()
-
-HEADERS = {
-    "APCA-API-KEY-ID": ALPACA_API_KEY,
-    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-}
-
-
-# ============================================================
-# STRATEGY
-# ============================================================
-
-TIMEFRAME = "4Min"
-
-EMA_FAST = 5
-EMA_SLOW = 9
-EMA_TREND = 30
-
-PREMARKET_START = dt_time(4, 0)
-PREMARKET_END = dt_time(9, 30)
-
-RTH_START = dt_time(9, 30)
-RTH_END = dt_time(16, 0)
-
-SPY_TARGET = 1.00
-IWM_TARGET = 0.50
-DEFAULT_TARGET = 1.00
-
-MAX_TRADES_PER_DAY = 2
-
-MIN_WIN_RATE = float(
-    os.getenv(
-        "MIN_WIN_RATE",
-        "90"
-    )
-)
-
-
-# ============================================================
-# SEPARATE CALL / PUT SAMPLE
-# ============================================================
-
-ROLLING_TRADES = int(
-    os.getenv(
-        "ROLLING_TRADES",
-        "64"
-    )
-)
-
-# 58 / 64 = 90.625%
-REQUIRED_WINS = 58
-
-
-# ============================================================
-# HISTORY / SCANNER
-# ============================================================
-
-HISTORY_DAYS = int(
-    os.getenv(
-        "HISTORY_DAYS",
-        "365"
-    )
-)
-
-BATCH_SIZE = int(
-    os.getenv(
-        "BATCH_SIZE",
-        "40"
-    )
-)
-
-REQUEST_PAUSE = float(
-    os.getenv(
-        "REQUEST_PAUSE",
-        "0.30"
-    )
-)
-
-
-# ============================================================
-# AUTOMATIC SCAN
-# 4:15 PM ET
-# ============================================================
-
-SCAN_HOUR_ET = int(
-    os.getenv(
-        "SCAN_HOUR_ET",
-        "16"
-    )
-)
-
-SCAN_MINUTE_ET = int(
-    os.getenv(
-        "SCAN_MINUTE_ET",
-        "15"
-    )
-)
-
-
-# ============================================================
-# STATE
-# ============================================================
+PRIORITY = ['SPY','QQQ','IWM','AAPL','NVDA','TSLA','AMD','AMZN','META','MSFT','GOOGL','NFLX','AVGO','PLTR','COIN','MSTR']
 
 lock = threading.Lock()
-
 STATE = {
-    "status": "STARTING",
-    "universe_count": 0,
-    "scanned_count": 0,
-    "qualified_count": 0,
-    "call_qualified_count": 0,
-    "put_qualified_count": 0,
-    "last_scan": None,
-    "scan_started": None,
-    "results": [],
-    "qualified": [],
-    "error": None,
+    'status': 'STARTING', 'last_scan': None, 'universe_count': 0,
+    'liquid_count': 0, 'watchlist_count': 0, 'watchlist': [], 'error': None,
 }
 
 
-# ============================================================
-# API REQUEST
-# ============================================================
-
-def api_request(url, params=None, timeout=60):
-
-    response = requests.get(
-        url,
-        headers=HEADERS,
-        params=params,
-        timeout=timeout,
-    )
-
-    if not response.ok:
-
-        raise RuntimeError(
-            f"{response.status_code}: "
-            f"{response.text[:500]}"
-        )
-
-    return response.json()
+def req(method, url, params=None, timeout=45):
+    r = requests.request(method, url, headers=HEADERS, params=params, timeout=timeout)
+    if not r.ok:
+        raise RuntimeError(f'{r.status_code}: {r.text[:400]}')
+    return r.json() if r.text else {}
 
 
-# ============================================================
-# FULL ACTIVE U.S. EQUITY UNIVERSE
-# ============================================================
+def chunks(items, n):
+    for i in range(0, len(items), n):
+        yield items[i:i+n]
 
-def get_entire_market():
 
-    logging.info(
-        "Downloading complete active Alpaca U.S. equity universe..."
-    )
-
-    assets = api_request(
-        f"{TRADING_URL}/v2/assets",
-        params={
-            "status": "active",
-            "asset_class": "us_equity",
-        }
-    )
-
-    symbols = []
-
-    for asset in assets:
-
-        symbol = str(
-            asset.get(
-                "symbol",
-                ""
-            )
-        ).upper().strip()
-
-        if not symbol:
+def get_universe():
+    assets = req('GET', f'{TRADING_URL}/v2/assets', params={'status':'active','asset_class':'us_equity'})
+    out = []
+    for a in assets:
+        s = str(a.get('symbol','')).upper().strip()
+        if not s or not a.get('tradable', False) or '/' in s or '.' in s:
             continue
-
-        # Only stocks Alpaca can actually trade.
-        if not asset.get(
-            "tradable",
-            False
-        ):
-            continue
-
-        # Avoid crypto-style symbols.
-        if "/" in symbol:
-            continue
-
-        symbols.append(
-            symbol
-        )
-
-    symbols = sorted(
-        set(symbols)
-    )
-
-    logging.info(
-        "FULL MARKET UNIVERSE LOADED: %s symbols",
-        len(symbols)
-    )
-
-    return symbols
+        out.append(s)
+    return list(dict.fromkeys(PRIORITY + sorted(set(out))))
 
 
-# ============================================================
-# TARGET
-# ============================================================
+def liquid_universe(symbols):
+    ranked = []
+    for batch in chunks(symbols, SNAPSHOT_BATCH):
+        data = req('GET', f'{DATA_URL}/v2/stocks/snapshots', params={'symbols': ','.join(batch), 'feed': DATA_FEED})
+        for s, snap in (data or {}).items():
+            day = snap.get('dailyBar') or {}
+            prev = snap.get('prevDailyBar') or {}
+            price = float((snap.get('latestTrade') or {}).get('p') or day.get('c') or 0)
+            vol = float(day.get('v') or prev.get('v') or 0)
+            dv = price * vol
+            if price >= MIN_PRICE and dv >= MIN_DOLLAR_VOLUME:
+                ranked.append((s, dv, price))
+        time.sleep(0.05)
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    keep = {s for s,_,_ in ranked[:MAX_LIVE_UNIVERSE]}
+    keep.update(s for s in PRIORITY if s in symbols)
+    meta = {s:{'dollar_volume':dv,'snapshot_price':p} for s,dv,p in ranked if s in keep}
+    return list(keep), meta
 
-def target_move(symbol):
 
-    if symbol == "IWM":
-        return IWM_TARGET
-
-    if symbol == "SPY":
-        return SPY_TARGET
-
-    return DEFAULT_TARGET
-
-
-# ============================================================
-# DOWNLOAD BARS FOR BATCH
-# ============================================================
-
-def get_batch_bars(symbols):
-
-    if not symbols:
-        return {}
-
-    end = datetime.now(
-        UTC
-    )
-
-    start = (
-        end -
-        timedelta(
-            days=HISTORY_DAYS
-        )
-    )
-
+def get_batch_bars(symbols, days=3):
+    if not symbols: return {}
+    end = datetime.now(UTC)
+    start = end - timedelta(days=days)
     params = {
-        "symbols": ",".join(symbols),
-        "timeframe": TIMEFRAME,
-        "start": start.isoformat(),
-        "end": end.isoformat(),
-        "adjustment": "raw",
-        "feed": DATA_FEED,
-        "sort": "asc",
-        "limit": 10000,
+        'symbols': ','.join(symbols), 'timeframe': TIMEFRAME,
+        'start': start.isoformat(), 'end': end.isoformat(), 'adjustment':'raw',
+        'feed': DATA_FEED, 'sort':'asc', 'limit':10000,
     }
-
-    collected = {
-        symbol: []
-        for symbol in symbols
-    }
-
-    page_token = None
-
+    out = {s:[] for s in symbols}
+    token = None
     while True:
-
-        if page_token:
-
-            params[
-                "page_token"
-            ] = page_token
-
-        elif "page_token" in params:
-
-            del params[
-                "page_token"
-            ]
-
-        result = api_request(
-            f"{DATA_URL}/v2/stocks/bars",
-            params=params
-        )
-
-        bars_by_symbol = result.get(
-            "bars",
-            {}
-        )
-
-        for symbol, bars in bars_by_symbol.items():
-
-            if symbol not in collected:
-
-                collected[
-                    symbol
-                ] = []
-
-            collected[
-                symbol
-            ].extend(
-                bars
-            )
-
-        page_token = result.get(
-            "next_page_token"
-        )
-
-        if not page_token:
-            break
-
-        time.sleep(
-            REQUEST_PAUSE
-        )
-
-    return collected
+        if token: params['page_token'] = token
+        elif 'page_token' in params: params.pop('page_token')
+        data = req('GET', f'{DATA_URL}/v2/stocks/bars', params=params)
+        for s, bars in (data.get('bars') or {}).items(): out.setdefault(s, []).extend(bars)
+        token = data.get('next_page_token')
+        if not token: break
+    return out
 
 
-# ============================================================
-# DATAFRAME
-# ============================================================
+def to_df(bars):
+    if not bars: return pd.DataFrame()
+    df = pd.DataFrame(bars).rename(columns={'t':'timestamp','o':'open','h':'high','l':'low','c':'close','v':'volume'})
+    if not {'timestamp','open','high','low','close','volume'}.issubset(df.columns): return pd.DataFrame()
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    df = df.set_index('timestamp').tz_convert(NY).sort_index()
+    for c in ['open','high','low','close','volume']: df[c] = pd.to_numeric(df[c], errors='coerce')
+    return df.dropna(subset=['open','high','low','close'])
 
-def bars_to_dataframe(bars):
-
-    if not bars:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(
-        bars
-    )
-
-    required = {
-        "t",
-        "o",
-        "h",
-        "l",
-        "c",
-        "v",
-    }
-
-    if not required.issubset(
-        set(df.columns)
-    ):
-
-        return pd.DataFrame()
-
-    df = df.rename(
-        columns={
-            "t": "timestamp",
-            "o": "open",
-            "h": "high",
-            "l": "low",
-            "c": "close",
-            "v": "volume",
-        }
-    )
-
-    df[
-        "timestamp"
-    ] = pd.to_datetime(
-        df["timestamp"],
-        utc=True
-    )
-
-    df = df.set_index(
-        "timestamp"
-    )
-
-    df = df.tz_convert(
-        NY
-    )
-
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    ]:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-    df = df.dropna(
-        subset=[
-            "open",
-            "high",
-            "low",
-            "close",
-        ]
-    )
-
-    return df.sort_index()
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
 
 def add_indicators(df):
-
-    if df.empty:
-        return df
-
     df = df.copy()
-
-    df["ema5"] = (
-        df["close"]
-        .ewm(
-            span=EMA_FAST,
-            adjust=False
-        )
-        .mean()
-    )
-
-    df["ema9"] = (
-        df["close"]
-        .ewm(
-            span=EMA_SLOW,
-            adjust=False
-        )
-        .mean()
-    )
-
-    df["ema30"] = (
-        df["close"]
-        .ewm(
-            span=EMA_TREND,
-            adjust=False
-        )
-        .mean()
-    )
-
-    typical = (
-        df["high"] +
-        df["low"] +
-        df["close"]
-    ) / 3.0
-
-    dates = pd.Series(
-        df.index.date,
-        index=df.index
-    )
-
-    pv = (
-        typical *
-        df["volume"]
-    )
-
-    cumulative_pv = (
-        pv.groupby(
-            dates
-        ).cumsum()
-    )
-
-    cumulative_volume = (
-        df["volume"]
-        .groupby(
-            dates
-        )
-        .cumsum()
-        .replace(
-            0,
-            float("nan")
-        )
-    )
-
-    df["vwap"] = (
-        cumulative_pv /
-        cumulative_volume
-    )
-
+    df['ema5'] = df.close.ewm(span=EMA_FAST, adjust=False).mean()
+    df['ema9'] = df.close.ewm(span=EMA_SLOW, adjust=False).mean()
+    df['ema30'] = df.close.ewm(span=EMA_TREND, adjust=False).mean()
+    prev = df.close.shift(1)
+    tr = pd.concat([(df.high-df.low).abs(), (df.high-prev).abs(), (df.low-prev).abs()], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(14, min_periods=5).mean()
+    dates = pd.Series(df.index.date, index=df.index)
+    tp = (df.high + df.low + df.close)/3
+    cumv = df.volume.groupby(dates).cumsum().replace(0, math.nan)
+    df['vwap'] = (tp*df.volume).groupby(dates).cumsum()/cumv
+    df['vol_sma20'] = df.volume.rolling(20, min_periods=5).mean()
     return df
 
 
-# ============================================================
-# TRADE RECORD
-# ============================================================
+def closed_only(df):
+    if df.empty: return df
+    now = datetime.now(NY)
+    return df[df.index + pd.Timedelta(minutes=4) <= now]
 
-def make_trade_record(
-    side,
-    entry_price,
-    exit_price,
-    entry_time,
-    exit_time,
-    reason
-):
 
-    if side == "CALL":
+def cluster_levels(values, tolerance):
+    vals = sorted(float(v) for v in values if pd.notna(v))
+    clusters = []
+    for v in vals:
+        if not clusters or abs(v - sum(clusters[-1])/len(clusters[-1])) > tolerance:
+            clusters.append([v])
+        else:
+            clusters[-1].append(v)
+    return [(sum(c)/len(c), len(c)) for c in clusters]
 
-        move = (
-            exit_price -
-            entry_price
-        )
 
+def levels_from_df(df, price, atr):
+    w = df.tail(LEVEL_LOOKBACK)
+    lows, highs = [], []
+    for i in range(2, len(w)-2):
+        lo = float(w.low.iloc[i]); hi = float(w.high.iloc[i])
+        if lo <= float(w.low.iloc[i-2:i+3].min()): lows.append(lo)
+        if hi >= float(w.high.iloc[i-2:i+3].max()): highs.append(hi)
+    tol = max(price*0.0008, atr*0.18, 0.02)
+    supports = cluster_levels(lows, tol)
+    resistances = cluster_levels(highs, tol)
+    below = [(x,n) for x,n in supports if x < price]
+    above = [(x,n) for x,n in resistances if x > price]
+    support = max(below, default=(None,0), key=lambda z:z[0])
+    resistance = min(above, default=(None,0), key=lambda z:z[0])
+    return support, resistance, tol
+
+
+def previous_day_levels(df, today):
+    prev = df[df.index.date < today]
+    if prev.empty: return None, None
+    d = prev.index.date[-1]
+    p = prev[prev.index.date == d]
+    return float(p.high.max()), float(p.low.min())
+
+
+def analyze(symbol, raw, meta):
+    df = closed_only(add_indicators(to_df(raw)))
+    if len(df) < 35: return None
+    today = datetime.now(NY).date()
+    td = df[df.index.date == today]
+    if len(td) < 3: return None
+    row, prev = td.iloc[-1], td.iloc[-2]
+    price = float(row.close); atr = float(row.atr if pd.notna(row.atr) else max(price*0.003,0.05))
+    vwap = float(row.vwap) if pd.notna(row.vwap) else price
+    rvol = float(row.volume / row.vol_sma20) if pd.notna(row.vol_sma20) and row.vol_sma20 else 1.0
+    pm = td[(td.index.time >= PREMARKET_START) & (td.index.time < PREMARKET_END)]
+    pmh = float(pm.high.max()) if not pm.empty else None
+    pml = float(pm.low.min()) if not pm.empty else None
+    pdh, pdl = previous_day_levels(df, today)
+
+    support, resistance, tol = levels_from_df(df, price, atr)
+    s, stouches = support; r, rtouches = resistance
+    if pml and pml < price and (s is None or pml > s): s, stouches = pml, 3
+    if pdl and pdl < price and (s is None or pdl > s): s, stouches = pdl, max(stouches,2)
+    if pmh and pmh > price and (r is None or pmh < r): r, rtouches = pmh, 3
+    if pdh and pdh > price and (r is None or pdh < r): r, rtouches = pdh, max(rtouches,2)
+
+    bull = row.ema5 > row.ema9 > row.ema30
+    bear = row.ema5 < row.ema9 < row.ema30
+    mom = (price - float(td.close.iloc[-3])) / max(atr, 1e-6)
+    direction = 'CALL' if (bull and price > vwap) else 'PUT' if (bear and price < vwap) else ('CALL' if mom > 0.35 else 'PUT' if mom < -0.35 else 'NONE')
+    if direction == 'NONE': return None
+
+    trigger = r if direction == 'CALL' else s
+    if trigger is None: return None
+    distance = abs(price-trigger)
+    proximity = max(0.0, 1.0 - distance/max(atr*1.25, 0.05))
+    target = None
+    if direction == 'CALL':
+        above = sorted([x for x,_ in cluster_levels(df.tail(LEVEL_LOOKBACK).high.tolist(), tol) if x > max(price, trigger)])
+        target = above[0] if above else trigger + max(atr, price*0.002)
     else:
+        below = sorted([x for x,_ in cluster_levels(df.tail(LEVEL_LOOKBACK).low.tolist(), tol) if x < min(price, trigger)], reverse=True)
+        target = below[0] if below else trigger - max(atr, price*0.002)
 
-        move = (
-            entry_price -
-            exit_price
-        )
+    score = 0.0
+    if (direction=='CALL' and bull) or (direction=='PUT' and bear): score += 25
+    if (direction=='CALL' and price>vwap) or (direction=='PUT' and price<vwap): score += 15
+    score += min(max(rvol-0.8,0)/1.7, 1)*15
+    score += min(abs(mom)/1.2,1)*10
+    score += proximity*20
+    touches = rtouches if direction=='CALL' else stouches
+    score += min(touches/3,1)*10
+    room = abs(target-trigger) if target else 0
+    if room >= atr*0.6: score += 5
+    score = round(min(score,100),1)
+
+    prev_close = float(prev.close)
+    if direction == 'CALL':
+        crossed = prev_close <= trigger and price > trigger
+        status = 'BREAK_CONFIRMED' if crossed else ('WAITING_FOR_BREAK' if price <= trigger + tol else 'ABOVE_LEVEL')
+    else:
+        crossed = prev_close >= trigger and price < trigger
+        status = 'BREAK_CONFIRMED' if crossed else ('WAITING_FOR_BREAK' if price >= trigger - tol else 'BELOW_LEVEL')
 
     return {
-        "side": side,
-        "entry_price": entry_price,
-        "exit_price": exit_price,
-        "entry_time": entry_time.isoformat(),
-        "exit_time": exit_time.isoformat(),
-        "move": move,
-        "win": move > 0,
-        "reason": reason,
+        'symbol': symbol, 'direction': direction, 'score': score, 'status': status,
+        'price': round(price,4), 'trigger': round(trigger,4),
+        'support': round(s,4) if s else None, 'resistance': round(r,4) if r else None,
+        'target': round(target,4) if target else None, 'ema5': round(float(row.ema5),4),
+        'ema9': round(float(row.ema9),4), 'ema30': round(float(row.ema30),4),
+        'vwap': round(vwap,4), 'atr': round(atr,4), 'rvol': round(rvol,2),
+        'dollar_volume': round(float(meta.get(symbol,{}).get('dollar_volume',0)),2),
+        'bar_time': td.index[-1].isoformat(), 'touches': int(touches),
     }
 
 
-# ============================================================
-# CALCULATE STOCK STATS
-#
-# CALL:
-# last 64 CALL trades only
-#
-# PUT:
-# last 64 PUT trades only
-# ============================================================
-
-def calculate_stats(
-    symbol,
-    raw_df
-):
-
-    if raw_df.empty:
-        return None
-
-    df = add_indicators(
-        raw_df
-    )
-
-    target = target_move(
-        symbol
-    )
-
-    in_trade = False
-    long_trade = False
-
-    entry_price = None
-    entry_timestamp = None
-    target_price = None
-
-    trades_today = 0
-
-    pm_high = None
-    pm_low = None
-
-    previous_close = None
-    previous_date = None
-
-    current_signal = "WAITING"
-
-    completed_trades = []
-
-    for timestamp, row in df.iterrows():
-
-        current_date = timestamp.date()
-        current_time = timestamp.time()
-
-        close = float(
-            row["close"]
-        )
-
-        high = float(
-            row["high"]
-        )
-
-        low = float(
-            row["low"]
-        )
-
-        ema5 = float(
-            row["ema5"]
-        )
-
-        ema9 = float(
-            row["ema9"]
-        )
-
-        ema30 = float(
-            row["ema30"]
-        )
-
-        vwap = float(
-            row["vwap"]
-        )
-
-        # ====================================================
-        # NEW DAY
-        # ====================================================
-
-        if (
-            previous_date is None
-            or
-            current_date != previous_date
-        ):
-
-            trades_today = 0
-            pm_high = None
-            pm_low = None
-
-        # ====================================================
-        # PREMARKET
-        # ====================================================
-
-        in_pm = (
-            current_time >= PREMARKET_START
-            and
-            current_time < PREMARKET_END
-        )
-
-        if in_pm:
-
-            if pm_high is None:
-
-                pm_high = high
-
-            else:
-
-                pm_high = max(
-                    pm_high,
-                    high
-                )
-
-            if pm_low is None:
-
-                pm_low = low
-
-            else:
-
-                pm_low = min(
-                    pm_low,
-                    low
-                )
-
-        # ====================================================
-        # REGULAR MARKET
-        # ====================================================
-
-        in_rth = (
-            current_time >= RTH_START
-            and
-            current_time < RTH_END
-        )
-
-        bull_trend = (
-            ema5 > ema9
-            and
-            ema9 > ema30
-        )
-
-        bear_trend = (
-            ema5 < ema9
-            and
-            ema9 < ema30
-        )
-
-        bull_vwap = (
-            close > vwap
-        )
-
-        bear_vwap = (
-            close < vwap
-        )
-
-        # ====================================================
-        # MANAGE EXISTING TRADE
-        # ====================================================
-
-        if in_trade:
-
-            if long_trade:
-
-                # CALL target
-                if high >= target_price:
-
-                    completed_trades.append(
-                        make_trade_record(
-                            side="CALL",
-                            entry_price=entry_price,
-                            exit_price=target_price,
-                            entry_time=entry_timestamp,
-                            exit_time=timestamp,
-                            reason="TARGET"
-                        )
-                    )
-
-                    in_trade = False
-                    current_signal = "WAITING"
-
-                # CALL EMA9 close invalidation
-                elif close <= ema9:
-
-                    completed_trades.append(
-                        make_trade_record(
-                            side="CALL",
-                            entry_price=entry_price,
-                            exit_price=close,
-                            entry_time=entry_timestamp,
-                            exit_time=timestamp,
-                            reason="EMA9"
-                        )
-                    )
-
-                    in_trade = False
-                    current_signal = "WAITING"
-
-            else:
-
-                # PUT target
-                if low <= target_price:
-
-                    completed_trades.append(
-                        make_trade_record(
-                            side="PUT",
-                            entry_price=entry_price,
-                            exit_price=target_price,
-                            entry_time=entry_timestamp,
-                            exit_time=timestamp,
-                            reason="TARGET"
-                        )
-                    )
-
-                    in_trade = False
-                    current_signal = "WAITING"
-
-                # PUT EMA9 close invalidation
-                elif close >= ema9:
-
-                    completed_trades.append(
-                        make_trade_record(
-                            side="PUT",
-                            entry_price=entry_price,
-                            exit_price=close,
-                            entry_time=entry_timestamp,
-                            exit_time=timestamp,
-                            reason="EMA9"
-                        )
-                    )
-
-                    in_trade = False
-                    current_signal = "WAITING"
-
-        # ====================================================
-        # BREAKOUT CONDITIONS
-        # ====================================================
-
-        long_break = False
-        short_break = False
-
-        if (
-            in_rth
-            and
-            pm_high is not None
-            and
-            previous_close is not None
-        ):
-
-            long_break = (
-                close > pm_high
-                and
-                previous_close <= pm_high
-                and
-                bull_trend
-                and
-                bull_vwap
-            )
-
-        if (
-            in_rth
-            and
-            pm_low is not None
-            and
-            previous_close is not None
-        ):
-
-            short_break = (
-                close < pm_low
-                and
-                previous_close >= pm_low
-                and
-                bear_trend
-                and
-                bear_vwap
-            )
-
-        # ====================================================
-        # ENTRY
-        # ====================================================
-
-        can_trade = (
-            not in_trade
-            and
-            trades_today < MAX_TRADES_PER_DAY
-        )
-
-        long_entry = (
-            long_break
-            and
-            can_trade
-        )
-
-        short_entry = (
-            short_break
-            and
-            can_trade
-        )
-
-        if long_entry:
-
-            in_trade = True
-            long_trade = True
-
-            entry_price = close
-            entry_timestamp = timestamp
-
-            target_price = (
-                close +
-                target
-            )
-
-            trades_today += 1
-            current_signal = "CALL SIGNAL"
-
-        elif short_entry:
-
-            in_trade = True
-            long_trade = False
-
-            entry_price = close
-            entry_timestamp = timestamp
-
-            target_price = (
-                close -
-                target
-            )
-
-            trades_today += 1
-            current_signal = "PUT SIGNAL"
-
-        previous_close = close
-        previous_date = current_date
-
-    # ========================================================
-    # SEPARATE HISTORICAL CALLS / PUTS
-    # ========================================================
-
-    historical_calls = [
-        trade
-        for trade in completed_trades
-        if trade["side"] == "CALL"
-    ]
-
-    historical_puts = [
-        trade
-        for trade in completed_trades
-        if trade["side"] == "PUT"
-    ]
-
-    historical_trade_count = len(
-        completed_trades
-    )
-
-    historical_call_count = len(
-        historical_calls
-    )
-
-    historical_put_count = len(
-        historical_puts
-    )
-
-    # ========================================================
-    # EXACT LAST 64 CALL TRADES
-    # ========================================================
-
-    rolling_calls = historical_calls[
-        -ROLLING_TRADES:
-    ]
-
-    call_trades = len(
-        rolling_calls
-    )
-
-    call_full_sample = (
-        call_trades ==
-        ROLLING_TRADES
-    )
-
-    call_wins = sum(
-        1
-        for trade in rolling_calls
-        if trade["win"]
-    )
-
-    call_losses = (
-        call_trades -
-        call_wins
-    )
-
-    call_rate = (
-        call_wins *
-        100.0 /
-        call_trades
-        if call_trades
-        else 0.0
-    )
-
-    # ========================================================
-    # EXACT LAST 64 PUT TRADES
-    # ========================================================
-
-    rolling_puts = historical_puts[
-        -ROLLING_TRADES:
-    ]
-
-    put_trades = len(
-        rolling_puts
-    )
-
-    put_full_sample = (
-        put_trades ==
-        ROLLING_TRADES
-    )
-
-    put_wins = sum(
-        1
-        for trade in rolling_puts
-        if trade["win"]
-    )
-
-    put_losses = (
-        put_trades -
-        put_wins
-    )
-
-    put_rate = (
-        put_wins *
-        100.0 /
-        put_trades
-        if put_trades
-        else 0.0
-    )
-
-    # ========================================================
-    # 90% QUALIFICATION
-    # ========================================================
-
-    call_qualified = (
-        call_full_sample
-        and
-        call_wins >= REQUIRED_WINS
-        and
-        call_rate >= MIN_WIN_RATE
-    )
-
-    put_qualified = (
-        put_full_sample
-        and
-        put_wins >= REQUIRED_WINS
-        and
-        put_rate >= MIN_WIN_RATE
-    )
-
-    qualified = (
-        call_qualified
-        or
-        put_qualified
-    )
-
-    if (
-        call_qualified
-        and
-        put_qualified
-    ):
-
-        qualification = "CALL + PUT"
-
-    elif call_qualified:
-
-        qualification = "CALL"
-
-    elif put_qualified:
-
-        qualification = "PUT"
-
-    else:
-
-        qualification = "SKIP"
-
-    best_rate = max(
-        call_rate
-        if call_full_sample
-        else 0.0,
-        put_rate
-        if put_full_sample
-        else 0.0
-    )
-
-    call_net_move = sum(
-        trade["move"]
-        for trade in rolling_calls
-    )
-
-    put_net_move = sum(
-        trade["move"]
-        for trade in rolling_puts
-    )
-
-    if in_trade:
-
-        current_signal = (
-            "CALL ACTIVE"
-            if long_trade
-            else "PUT ACTIVE"
-        )
-
-    return {
-
-        "symbol": symbol,
-
-        "overall": round(
-            best_rate,
-            1
-        ),
-
-        "rolling_win_rate": round(
-            best_rate,
-            1
-        ),
-
-        # CALL
-
-        "call_rate": round(
-            call_rate,
-            1
-        ),
-
-        "call_wins": call_wins,
-
-        "call_losses": call_losses,
-
-        "call_trades": call_trades,
-
-        "call_full_sample": call_full_sample,
-
-        "call_qualified": call_qualified,
-
-        "historical_call_count":
-            historical_call_count,
-
-        "call_net_move": round(
-            call_net_move,
-            2
-        ),
-
-        # PUT
-
-        "put_rate": round(
-            put_rate,
-            1
-        ),
-
-        "put_wins": put_wins,
-
-        "put_losses": put_losses,
-
-        "put_trades": put_trades,
-
-        "put_full_sample": put_full_sample,
-
-        "put_qualified": put_qualified,
-
-        "historical_put_count":
-            historical_put_count,
-
-        "put_net_move": round(
-            put_net_move,
-            2
-        ),
-
-        # HISTORY
-
-        "historical_trade_count":
-            historical_trade_count,
-
-        "sample_required":
-            ROLLING_TRADES,
-
-        "required_wins":
-            REQUIRED_WINS,
-
-        # RESULT
-
-        "qualified":
-            qualified,
-
-        "qualification":
-            qualification,
-
-        "signal":
-            current_signal,
-    }
-
-
-# ============================================================
-# PROCESS BATCH
-# ============================================================
-
-def process_batch(symbols):
-
-    bars_by_symbol = get_batch_bars(
-        symbols
-    )
-
+def run_scan():
+    with lock: STATE.update(status='SCANNING', error=None)
+    symbols = get_universe()
+    live, meta = liquid_universe(symbols)
     results = []
-
-    for symbol in symbols:
-
-        try:
-
-            bars = bars_by_symbol.get(
-                symbol,
-                []
-            )
-
-            df = bars_to_dataframe(
-                bars
-            )
-
-            stats = calculate_stats(
-                symbol,
-                df
-            )
-
-            with lock:
-
-                STATE[
-                    "scanned_count"
-                ] += 1
-
-            if not stats:
-                continue
-
-            results.append(
-                stats
-            )
-
-            logging.info(
-                "%s | CALL %s/64 %.1f%% %s | "
-                "PUT %s/64 %.1f%% %s | %s",
-                symbol,
-                stats["call_trades"],
-                stats["call_rate"],
-                "QUALIFIED"
-                if stats["call_qualified"]
-                else "SKIP",
-                stats["put_trades"],
-                stats["put_rate"],
-                "QUALIFIED"
-                if stats["put_qualified"]
-                else "SKIP",
-                stats["qualification"],
-            )
-
-        except Exception as exc:
-
-            with lock:
-
-                STATE[
-                    "scanned_count"
-                ] += 1
-
-            logging.warning(
-                "%s failed: %s",
-                symbol,
-                exc
-            )
-
-    return results
-
-
-# ============================================================
-# FULL MARKET SCAN
-# ============================================================
-
-def run_full_market_scan():
-
+    for batch in chunks(live, BAR_BATCH):
+        bars = get_batch_bars(batch)
+        for s in batch:
+            try:
+                item = analyze(s, bars.get(s,[]), meta)
+                if item and item['score'] >= MIN_SETUP_SCORE: results.append(item)
+            except Exception as e:
+                logging.warning('%s analyze error: %s', s, e)
+        time.sleep(0.05)
+    results.sort(key=lambda x:(x['score'], x['dollar_volume']), reverse=True)
+    watch = results[:WATCHLIST_SIZE]
     with lock:
+        STATE.update(status='READY', last_scan=datetime.now(NY).isoformat(), universe_count=len(symbols),
+                     liquid_count=len(live), watchlist_count=len(watch), watchlist=watch, error=None)
+    logging.info('scan ready | universe=%s liquid=%s watch=%s', len(symbols), len(live), len(watch))
 
-        if STATE[
-            "status"
-        ] == "SCANNING":
 
-            logging.info(
-                "Scan already running."
-            )
-
-            return
-
-        STATE["status"] = "LOADING FULL MARKET"
-
-        STATE["universe_count"] = 0
-        STATE["scanned_count"] = 0
-
-        STATE["qualified_count"] = 0
-
-        STATE[
-            "call_qualified_count"
-        ] = 0
-
-        STATE[
-            "put_qualified_count"
-        ] = 0
-
-        STATE["results"] = []
-        STATE["qualified"] = []
-
-        STATE["error"] = None
-
-        STATE[
-            "scan_started"
-        ] = datetime.now(
-            NY
-        ).isoformat()
-
-    try:
-
-        # ----------------------------------------------------
-        # LOAD ENTIRE MARKET FIRST
-        # ----------------------------------------------------
-
-        universe = get_entire_market()
-
-        if not universe:
-
-            raise RuntimeError(
-                "Alpaca returned zero active tradable U.S. stocks."
-            )
-
-        with lock:
-
-            STATE[
-                "universe_count"
-            ] = len(
-                universe
-            )
-
-            STATE[
-                "status"
-            ] = "SCANNING"
-
-        logging.info(
-            "FULL MARKET SCAN STARTED"
-        )
-
-        logging.info(
-            "Market symbols: %s",
-            len(universe)
-        )
-
-        # ----------------------------------------------------
-        # SPLIT ENTIRE MARKET INTO BATCHES
-        # ----------------------------------------------------
-
-        batches = [
-            universe[
-                i:
-                i + BATCH_SIZE
-            ]
-            for i in range(
-                0,
-                len(universe),
-                BATCH_SIZE
-            )
-        ]
-
-        logging.info(
-            "Scanning %s stocks in %s batches",
-            len(universe),
-            len(batches)
-        )
-
-        all_results = []
-
-        # ----------------------------------------------------
-        # SCAN EVERY BATCH
-        # ----------------------------------------------------
-
-        for number, batch in enumerate(
-            batches,
-            start=1
-        ):
-
-            logging.info(
-                "Batch %s/%s | %s symbols",
-                number,
-                len(batches),
-                len(batch)
-            )
-
-            batch_results = process_batch(
-                batch
-            )
-
-            all_results.extend(
-                batch_results
-            )
-
-            all_results.sort(
-                key=lambda stock: (
-                    stock["qualified"],
-                    stock["rolling_win_rate"],
-                    max(
-                        stock["call_wins"],
-                        stock["put_wins"]
-                    )
-                ),
-                reverse=True
-            )
-
-            qualified = [
-                stock
-                for stock in all_results
-                if stock["qualified"]
-            ]
-
-            call_qualified = [
-                stock
-                for stock in all_results
-                if stock["call_qualified"]
-            ]
-
-            put_qualified = [
-                stock
-                for stock in all_results
-                if stock["put_qualified"]
-            ]
-
-            with lock:
-
-                STATE[
-                    "results"
-                ] = all_results.copy()
-
-                STATE[
-                    "qualified"
-                ] = qualified.copy()
-
-                STATE[
-                    "qualified_count"
-                ] = len(
-                    qualified
-                )
-
-                STATE[
-                    "call_qualified_count"
-                ] = len(
-                    call_qualified
-                )
-
-                STATE[
-                    "put_qualified_count"
-                ] = len(
-                    put_qualified
-                )
-
-            time.sleep(
-                REQUEST_PAUSE
-            )
-
-        now = datetime.now(
-            NY
-        )
-
-        with lock:
-
-            STATE[
-                "status"
-            ] = "READY"
-
-            STATE[
-                "last_scan"
-            ] = now.isoformat()
-
-        logging.info(
-            "FULL MARKET SCAN COMPLETE"
-        )
-
-        logging.info(
-            "Universe: %s",
-            STATE["universe_count"]
-        )
-
-        logging.info(
-            "Scanned: %s",
-            STATE["scanned_count"]
-        )
-
-        logging.info(
-            "90%%+ CALL stocks: %s",
-            STATE["call_qualified_count"]
-        )
-
-        logging.info(
-            "90%%+ PUT stocks: %s",
-            STATE["put_qualified_count"]
-        )
-
-    except Exception as exc:
-
-        logging.exception(
-            "Full-market scan failed"
-        )
-
-        with lock:
-
-            STATE[
-                "status"
-            ] = "ERROR"
-
-            STATE[
-                "error"
-            ] = str(
-                exc
-            )
-
-
-# ============================================================
-# NEXT DAILY SCAN
-# ============================================================
-
-def get_next_scan_time():
-
-    now = datetime.now(
-        NY
-    )
-
-    target = now.replace(
-        hour=SCAN_HOUR_ET,
-        minute=SCAN_MINUTE_ET,
-        second=0,
-        microsecond=0
-    )
-
-    if target <= now:
-
-        target += timedelta(
-            days=1
-        )
-
-    return target
-
-
-# ============================================================
-# AUTOMATIC DAILY SCANNER
-# ============================================================
-
-def scanner_loop():
-
+def loop():
     while True:
-
-        try:
-
-            next_scan = get_next_scan_time()
-
-            logging.info(
-                "Next automatic scan: %s",
-                next_scan.isoformat()
-            )
-
-            while True:
-
-                now = datetime.now(
-                    NY
-                )
-
-                seconds_remaining = (
-                    next_scan -
-                    now
-                ).total_seconds()
-
-                if seconds_remaining <= 0:
-                    break
-
-                time.sleep(
-                    min(
-                        60,
-                        max(
-                            1,
-                            seconds_remaining
-                        )
-                    )
-                )
-
-            logging.info(
-                "Starting scheduled 4:15 PM ET full-market scan..."
-            )
-
-            run_full_market_scan()
-
-            # Prevent duplicate scan.
-            time.sleep(
-                90
-            )
-
-        except Exception:
-
-            logging.exception(
-                "Scanner scheduler error"
-            )
-
-            time.sleep(
-                60
-            )
-
-
-# ============================================================
-# IMMEDIATE STARTUP SCAN
-# ============================================================
-
-def startup_full_market_scan():
-
-    # Give Render / Flask time to boot.
-    time.sleep(
-        5
-    )
-
-    logging.info(
-        "STARTUP: loading and scanning entire market immediately..."
-    )
-
-    try:
-
-        run_full_market_scan()
-
-    except Exception as exc:
-
-        logging.exception(
-            "Startup scan failed"
-        )
-
-        with lock:
-
-            STATE[
-                "status"
-            ] = "ERROR"
-
-            STATE[
-                "error"
-            ] = str(
-                exc
-            )
-
-
-# ============================================================
-# IPHONE WATCHLIST
-# ============================================================
-
-HTML = """
-<!doctype html>
-
-<html>
-
-<head>
-
-<meta
-name="viewport"
-content="width=device-width, initial-scale=1">
-
-<meta
-http-equiv="refresh"
-content="30">
-
-<title>
-90% CALL / PUT Scanner
-</title>
-
-<style>
-
-body {
-    margin: 0;
-    padding: 14px;
-    background: #050505;
-    color: white;
-    font-family:
-        -apple-system,
-        BlinkMacSystemFont,
-        Arial,
-        sans-serif;
-}
-
-h1 {
-    font-size: 23px;
-    margin-bottom: 4px;
-}
-
-.subtitle {
-    color: #999;
-    font-size: 13px;
-    margin-bottom: 15px;
-}
-
-.summary {
-    background: #171717;
-    padding: 13px;
-    border-radius: 13px;
-    margin-bottom: 16px;
-    line-height: 1.7;
-}
-
-.progress {
-    width: 100%;
-    background: #333;
-    border-radius: 10px;
-    overflow: hidden;
-    margin-top: 12px;
-}
-
-.progressbar {
-    height: 10px;
-    background: #39d353;
-}
-
-.stock {
-    background: #171717;
-    padding: 14px;
-    border-radius: 14px;
-    margin-bottom: 10px;
-}
-
-.top {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-}
-
-.symbol {
-    font-size: 25px;
-    font-weight: 900;
-}
-
-.direction {
-    font-size: 17px;
-    font-weight: 900;
-}
-
-.call {
-    color: #39d353;
-}
-
-.put {
-    color: #ff4d4f;
-}
-
-.both {
-    color: #ffd43b;
-}
-
-.rates {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    margin-top: 12px;
-}
-
-.rate {
-    background: #0d0d0d;
-    padding: 12px;
-    border-radius: 10px;
-    text-align: center;
-}
-
-.label {
-    color: #999;
-    font-size: 10px;
-}
-
-.number {
-    font-size: 27px;
-    font-weight: 900;
-    margin-top: 3px;
-}
-
-.small {
-    color: #999;
-    font-size: 11px;
-}
-
-.good {
-    color: #39d353;
-}
-
-.bad {
-    color: #777;
-}
-
-.record {
-    margin-top: 10px;
-    font-size: 12px;
-    color: #aaa;
-    line-height: 1.6;
-}
-
-.status {
-    margin-top: 9px;
-    font-size: 12px;
-    font-weight: 700;
-}
-
-.empty {
-    padding: 25px;
-    border-radius: 14px;
-    background: #171717;
-    color: #999;
-    text-align: center;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<h1>
-90% CALL / PUT MARKET SCANNER
-</h1>
-
-<div class="subtitle">
-FULL ALPACA U.S. MARKET • Separate 64 CALL / 64 PUT trades
-</div>
-
-
-<div class="summary">
-
-<strong>Status:</strong>
-{{ status }}
-
-<br>
-
-<strong>Market symbols:</strong>
-{{ universe_count }}
-
-<br>
-
-<strong>Scanned:</strong>
-{{ scanned_count }} / {{ universe_count }}
-
-<br>
-
-<strong>Total qualifying stocks:</strong>
-{{ qualified_count }}
-
-<br>
-
-<span class="call">
-
-<strong>
-90%+ CALL stocks:
-</strong>
-
-{{ call_qualified_count }}
-
-</span>
-
-<br>
-
-<span class="put">
-
-<strong>
-90%+ PUT stocks:
-</strong>
-
-{{ put_qualified_count }}
-
-</span>
-
-<br>
-
-<strong>
-Required CALL sample:
-</strong>
-
-64 CALL trades
-
-<br>
-
-<strong>
-Required PUT sample:
-</strong>
-
-64 PUT trades
-
-<br>
-
-<strong>
-Required wins:
-</strong>
-
-58 / 64
-
-<br>
-
-<strong>
-Minimum:
-</strong>
-
-90%
-
-<br>
-
-<strong>
-Automatic scan:
-</strong>
-
-4:15 PM ET every day
-
-<br>
-
-<strong>
-Startup scan:
-</strong>
-
-YES
-
-<br>
-
-<strong>
-Last completed scan:
-</strong>
-
-{{ last_scan or "Scanning / not completed yet" }}
-
-
-{% if universe_count > 0 %}
-
-<div class="progress">
-
-<div
-class="progressbar"
-style="width:
-{{ ((scanned_count / universe_count) * 100) if universe_count else 0 }}%">
-</div>
-
-</div>
-
-{% endif %}
-
-
-{% if error %}
-
-<br><br>
-
-<span class="put">
-ERROR: {{ error }}
-</span>
-
-{% endif %}
-
-</div>
-
-
-{% if qualified %}
-
-
-{% for stock in qualified %}
-
-<div class="stock">
-
-<div class="top">
-
-<div class="symbol">
-{{ stock.symbol }}
-</div>
-
-
-{% if stock.qualification == "CALL" %}
-
-<div class="direction call">
-90% CALL
-</div>
-
-{% elif stock.qualification == "PUT" %}
-
-<div class="direction put">
-90% PUT
-</div>
-
-{% else %}
-
-<div class="direction both">
-90% CALL + PUT
-</div>
-
-{% endif %}
-
-</div>
-
-
-<div class="rates">
-
-<div class="rate">
-
-<div class="label">
-LAST 64 CALL TRADES
-</div>
-
-<div
-class="number
-{% if stock.call_qualified %}
-good
-{% else %}
-bad
-{% endif %}"
->
-
-{{ stock.call_rate }}%
-
-</div>
-
-<div class="small">
-
-{{ stock.call_wins }}W /
-
-{{ stock.call_losses }}L /
-
-{{ stock.call_trades }}/64
-
-</div>
-
-</div>
-
-
-<div class="rate">
-
-<div class="label">
-LAST 64 PUT TRADES
-</div>
-
-<div
-class="number
-{% if stock.put_qualified %}
-good
-{% else %}
-bad
-{% endif %}"
->
-
-{{ stock.put_rate }}%
-
-</div>
-
-<div class="small">
-
-{{ stock.put_wins }}W /
-
-{{ stock.put_losses }}L /
-
-{{ stock.put_trades }}/64
-
-</div>
-
-</div>
-
-</div>
-
-
-<div class="record">
-
-Historical CALL trades:
-{{ stock.historical_call_count }}
-
-<br>
-
-Historical PUT trades:
-{{ stock.historical_put_count }}
-
-<br>
-
-CALL net move:
-{{ stock.call_net_move }}
-
-<br>
-
-PUT net move:
-{{ stock.put_net_move }}
-
-</div>
-
-
-<div class="status">
-
-CURRENT STATUS:
-{{ stock.signal }}
-
-</div>
-
-</div>
-
-{% endfor %}
-
-
-{% else %}
-
-
-<div class="empty">
-
-{% if status == "SCANNING" %}
-
-Scanning the full market now.
-
-<br><br>
-
-Stocks processed:
-{{ scanned_count }} / {{ universe_count }}
-
-<br><br>
-
-Qualifying CALL / PUT stocks will appear here automatically.
-
-{% elif status == "LOADING FULL MARKET" %}
-
-Loading the full Alpaca U.S. stock universe...
-
-{% else %}
-
-No CALL or PUT stocks currently meet the separate
-90% / 64-trade requirement.
-
-<br><br>
-
-A CALL must have 64 CALL trades.
-
-<br>
-
-A PUT must have 64 PUT trades.
-
-{% endif %}
-
-</div>
-
-
-{% endif %}
-
-</body>
-
-</html>
-"""
-
-
-# ============================================================
-# WEBSITE
-# ============================================================
-
-@app.route("/")
+        try: run_scan()
+        except Exception as e:
+            logging.exception('scan failed')
+            with lock: STATE.update(status='ERROR', error=str(e)[:500])
+        time.sleep(SCAN_SECONDS)
+
+HTML = '''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><title>AI Trade Watchlist</title>
+<style>body{font-family:Arial;background:#0b0f14;color:#e7edf4;margin:18px}.card{background:#141a22;border:1px solid #263241;border-radius:12px;padding:14px;margin:10px 0}.big{font-size:28px;font-weight:800}.muted{color:#9fb0c2}.call{color:#41d17d}.put{color:#ff6464}.score{font-size:22px;font-weight:800}code{color:#cfe4ff}</style></head><body>
+<h2>AI Confirmation Watchlist</h2><div class="muted">{{state.status}} · {{state.last_scan}} · liquid {{state.liquid_count}}</div>
+{% for x in state.watchlist %}<div class="card"><div class="big">{{x.symbol}} <span class="{{'call' if x.direction=='CALL' else 'put'}}">{{x.direction}}</span> <span class="score">{{x.score}}/100</span></div>
+<div>{{x.status}} · price {{x.price}} · trigger <b>{{x.trigger}}</b> · target {{x.target}}</div><div class="muted">S {{x.support}} · R {{x.resistance}} · VWAP {{x.vwap}} · RVOL {{x.rvol}} · touches {{x.touches}}</div></div>{% endfor %}
+</body></html>'''
+
+@app.get('/')
 def home():
+    with lock: snap = dict(STATE); snap['watchlist'] = list(STATE['watchlist'])
+    return render_template_string(HTML, state=snap)
 
-    return jsonify({
-
-        "scanner":
-            "90% CALL / PUT Full Market Scanner",
-
-        "market":
-            "All active tradable Alpaca U.S. equities",
-
-        "timeframe":
-            TIMEFRAME,
-
-        "minimum_win_rate":
-            MIN_WIN_RATE,
-
-        "required_completed_trades_per_side":
-            ROLLING_TRADES,
-
-        "required_wins":
-            REQUIRED_WINS,
-
-        "automatic_scan_time":
-            f"{SCAN_HOUR_ET:02d}:{SCAN_MINUTE_ET:02d} ET",
-
-        "startup_scan":
-            True,
-
-        "watchlist":
-            "/watchlist",
-
-        "api":
-            "/api/watchlist",
-
-        "all_results":
-            "/api/all",
-
-        "manual_rescan":
-            "/rescan",
-
-        "health":
-            "/health",
-    })
-
-
-# ============================================================
-# WATCHLIST
-# ============================================================
-
-@app.route("/watchlist")
+@app.get('/api/watchlist')
 def watchlist():
+    with lock: return jsonify(dict(STATE))
 
-    with lock:
-
-        snapshot = {
-
-            "status":
-                STATE["status"],
-
-            "universe_count":
-                STATE["universe_count"],
-
-            "scanned_count":
-                STATE["scanned_count"],
-
-            "qualified_count":
-                STATE["qualified_count"],
-
-            "call_qualified_count":
-                STATE[
-                    "call_qualified_count"
-                ],
-
-            "put_qualified_count":
-                STATE[
-                    "put_qualified_count"
-                ],
-
-            "qualified":
-                STATE[
-                    "qualified"
-                ].copy(),
-
-            "last_scan":
-                STATE["last_scan"],
-
-            "error":
-                STATE["error"],
-        }
-
-    return render_template_string(
-        HTML,
-        **snapshot
-    )
-
-
-# ============================================================
-# WATCHLIST API
-# ============================================================
-
-@app.route("/api/watchlist")
-def api_watchlist():
-
-    with lock:
-
-        return jsonify({
-
-            "status":
-                STATE["status"],
-
-            "universe_count":
-                STATE["universe_count"],
-
-            "scanned_count":
-                STATE["scanned_count"],
-
-            "qualified_count":
-                STATE["qualified_count"],
-
-            "call_qualified_count":
-                STATE[
-                    "call_qualified_count"
-                ],
-
-            "put_qualified_count":
-                STATE[
-                    "put_qualified_count"
-                ],
-
-            "minimum_win_rate":
-                MIN_WIN_RATE,
-
-            "required_sample_per_side":
-                ROLLING_TRADES,
-
-            "required_wins":
-                REQUIRED_WINS,
-
-            "timeframe":
-                TIMEFRAME,
-
-            "automatic_scan_time_et":
-                f"{SCAN_HOUR_ET:02d}:{SCAN_MINUTE_ET:02d}",
-
-            "startup_scan":
-                True,
-
-            "last_scan":
-                STATE["last_scan"],
-
-            "qualified":
-                STATE["qualified"],
-
-            "error":
-                STATE["error"],
-        })
-
-
-# ============================================================
-# ALL RESULTS API
-# ============================================================
-
-@app.route("/api/all")
-def api_all():
-
-    with lock:
-
-        return jsonify({
-
-            "status":
-                STATE["status"],
-
-            "universe_count":
-                STATE["universe_count"],
-
-            "scanned_count":
-                STATE["scanned_count"],
-
-            "results":
-                STATE["results"],
-
-            "count":
-                len(
-                    STATE["results"]
-                ),
-        })
-
-
-# ============================================================
-# MANUAL RESCAN
-# ============================================================
-
-@app.route("/rescan")
-def rescan():
-
-    with lock:
-
-        already_scanning = (
-            STATE["status"] ==
-            "SCANNING"
-            or
-            STATE["status"] ==
-            "LOADING FULL MARKET"
-        )
-
-    if already_scanning:
-
-        return jsonify({
-            "status":
-                "already scanning",
-
-            "scanned":
-                STATE["scanned_count"],
-
-            "market_symbols":
-                STATE["universe_count"],
-        })
-
-    thread = threading.Thread(
-        target=run_full_market_scan,
-        daemon=True,
-        name="manual-full-market-scan"
-    )
-
-    thread.start()
-
-    return jsonify({
-        "status":
-            "manual full-market scan started"
-    })
-
-
-# ============================================================
-# HEALTH
-# ============================================================
-
-@app.route("/health")
+@app.get('/health')
 def health():
+    return jsonify({'ok':True,'status':STATE['status'],'last_scan':STATE['last_scan']})
 
-    return jsonify({
-
-        "status":
-            "healthy",
-
-        "alpaca_key_loaded":
-            bool(
-                ALPACA_API_KEY
-            ),
-
-        "alpaca_secret_loaded":
-            bool(
-                ALPACA_SECRET_KEY
-            ),
-
-        "scanner_status":
-            STATE["status"],
-
-        "universe_count":
-            STATE["universe_count"],
-
-        "scanned_count":
-            STATE["scanned_count"],
-
-        "rolling_sample_per_side":
-            ROLLING_TRADES,
-
-        "required_wins":
-            REQUIRED_WINS,
-
-        "minimum_win_rate":
-            MIN_WIN_RATE,
-
-        "daily_scan_time_et":
-            f"{SCAN_HOUR_ET:02d}:{SCAN_MINUTE_ET:02d}",
-
-        "startup_scan":
-            True,
-    })
-
-
-# ============================================================
-# START
-#
-# STARTUP:
-# Immediately loads/scans full market.
-#
-# DAILY:
-# Automatically scans again at 4:15 PM ET.
-# ============================================================
-
-if __name__ == "__main__":
-
-    # --------------------------------------------------------
-    # DAILY AUTOMATIC SCANNER
-    # --------------------------------------------------------
-
-    scheduler_thread = threading.Thread(
-        target=scanner_loop,
-        daemon=True,
-        name="daily-market-scanner"
-    )
-
-    scheduler_thread.start()
-
-    # --------------------------------------------------------
-    # IMMEDIATE STARTUP FULL-MARKET SCAN
-    # --------------------------------------------------------
-
-    startup_thread = threading.Thread(
-        target=startup_full_market_scan,
-        daemon=True,
-        name="startup-market-scan"
-    )
-
-    startup_thread.start()
-
-    # --------------------------------------------------------
-    # WEBSITE
-    # --------------------------------------------------------
-
-    port = int(
-        os.getenv(
-            "PORT",
-            "10000"
-        )
-    )
-
-    logging.info(
-        "90%% CALL / PUT scanner starting on port %s",
-        port
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        threaded=True,
-        use_reloader=False
-    )
+if __name__ == '__main__':
+    threading.Thread(target=loop, daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT','10000')))
+else:
+    threading.Thread(target=loop, daemon=True).start()
