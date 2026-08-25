@@ -37,7 +37,11 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
 
 TRADING_URL = "https://paper-api.alpaca.markets"
 DATA_URL = "https://data.alpaca.markets"
-DATA_FEED = os.getenv("DATA_FEED", "iex").strip().lower()
+
+DATA_FEED = os.getenv(
+    "DATA_FEED",
+    "iex"
+).strip().lower()
 
 HEADERS = {
     "APCA-API-KEY-ID": ALPACA_API_KEY,
@@ -58,15 +62,50 @@ EMA_TREND = 30
 PREMARKET_START = dt_time(4, 0)
 PREMARKET_END = dt_time(9, 30)
 
-MIN_PRICE = float(os.getenv("MIN_PRICE", "5"))
-MIN_DOLLAR_VOLUME = float(os.getenv("MIN_DOLLAR_VOLUME", "5000000"))
-MAX_LIVE_UNIVERSE = int(os.getenv("MAX_LIVE_UNIVERSE", "250"))
-WATCHLIST_SIZE = int(os.getenv("WATCHLIST_SIZE", "10"))
-MIN_SETUP_SCORE = float(os.getenv("MIN_SETUP_SCORE", "70"))
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "240"))
-SNAPSHOT_BATCH = int(os.getenv("SNAPSHOT_BATCH", "200"))
-BAR_BATCH = int(os.getenv("BAR_BATCH", "50"))
-LEVEL_LOOKBACK = int(os.getenv("LEVEL_LOOKBACK", "90"))
+MIN_PRICE = float(
+    os.getenv("MIN_PRICE", "5")
+)
+
+MIN_DOLLAR_VOLUME = float(
+    os.getenv("MIN_DOLLAR_VOLUME", "5000000")
+)
+
+MAX_LIVE_UNIVERSE = int(
+    os.getenv("MAX_LIVE_UNIVERSE", "250")
+)
+
+WATCHLIST_SIZE = int(
+    os.getenv("WATCHLIST_SIZE", "10")
+)
+
+NEAR_MISS_SIZE = int(
+    os.getenv("NEAR_MISS_SIZE", "10")
+)
+
+MIN_SETUP_SCORE = float(
+    os.getenv("MIN_SETUP_SCORE", "70")
+)
+
+SCAN_SECONDS = int(
+    os.getenv("SCAN_SECONDS", "240")
+)
+
+SNAPSHOT_BATCH = int(
+    os.getenv("SNAPSHOT_BATCH", "200")
+)
+
+BAR_BATCH = int(
+    os.getenv("BAR_BATCH", "50")
+)
+
+LEVEL_LOOKBACK = int(
+    os.getenv("LEVEL_LOOKBACK", "90")
+)
+
+
+# ============================================================
+# PRIORITY SYMBOLS
+# ============================================================
 
 PRIORITY = [
     "SPY",
@@ -99,17 +138,25 @@ STATE = {
     "last_scan": None,
     "universe_count": 0,
     "liquid_count": 0,
+
+    # QUALIFIED ONLY
     "watchlist_count": 0,
     "watchlist": [],
+
+    # WEBSITE DISPLAY ONLY
+    "near_miss_count": 0,
+    "near_misses": [],
+
     "error": None,
 }
 
 
 # ============================================================
-# REQUEST
+# ALPACA REQUEST
 # ============================================================
 
 def req(method, url, params=None, timeout=45):
+
     response = requests.request(
         method,
         url,
@@ -119,20 +166,33 @@ def req(method, url, params=None, timeout=45):
     )
 
     if not response.ok:
+
         raise RuntimeError(
-            f"{response.status_code}: {response.text[:400]}"
+            f"{response.status_code}: "
+            f"{response.text[:400]}"
         )
 
-    return response.json() if response.text else {}
+    if not response.text:
+        return {}
+
+    return response.json()
 
 
 # ============================================================
-# HELPERS
+# CHUNKS
 # ============================================================
 
 def chunks(items, size):
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
+
+    for i in range(
+        0,
+        len(items),
+        size
+    ):
+
+        yield items[
+            i:i + size
+        ]
 
 
 # ============================================================
@@ -140,6 +200,7 @@ def chunks(items, size):
 # ============================================================
 
 def get_universe():
+
     assets = req(
         "GET",
         f"{TRADING_URL}/v2/assets",
@@ -152,24 +213,40 @@ def get_universe():
     symbols = []
 
     for asset in assets:
+
         symbol = str(
-            asset.get("symbol", "")
+            asset.get(
+                "symbol",
+                ""
+            )
         ).upper().strip()
 
         if not symbol:
             continue
 
-        if not asset.get("tradable", False):
+        if not asset.get(
+            "tradable",
+            False
+        ):
             continue
 
-        if "/" in symbol or "." in symbol:
+        if (
+            "/" in symbol
+            or "." in symbol
+        ):
             continue
 
-        symbols.append(symbol)
+        symbols.append(
+            symbol
+        )
 
     return list(
         dict.fromkeys(
-            PRIORITY + sorted(set(symbols))
+            PRIORITY
+            +
+            sorted(
+                set(symbols)
+            )
         )
     )
 
@@ -179,27 +256,44 @@ def get_universe():
 # ============================================================
 
 def liquid_universe(symbols):
+
     ranked = []
 
     for batch in chunks(
         symbols,
         SNAPSHOT_BATCH
     ):
+
         data = req(
             "GET",
             f"{DATA_URL}/v2/stocks/snapshots",
             params={
-                "symbols": ",".join(batch),
+                "symbols": ",".join(
+                    batch
+                ),
                 "feed": DATA_FEED,
             },
         )
 
-        for symbol, snapshot in (data or {}).items():
-            day = snapshot.get("dailyBar") or {}
-            previous = snapshot.get("prevDailyBar") or {}
+        for symbol, snapshot in (
+            data or {}
+        ).items():
+
+            day = (
+                snapshot.get("dailyBar")
+                or {}
+            )
+
+            previous = (
+                snapshot.get("prevDailyBar")
+                or {}
+            )
 
             price = float(
-                (snapshot.get("latestTrade") or {}).get("p")
+                (
+                    snapshot.get("latestTrade")
+                    or {}
+                ).get("p")
                 or day.get("c")
                 or 0
             )
@@ -210,13 +304,19 @@ def liquid_universe(symbols):
                 or 0
             )
 
-            dollar_volume = price * volume
+            dollar_volume = (
+                price
+                *
+                volume
+            )
 
             if (
                 price >= MIN_PRICE
                 and
-                dollar_volume >= MIN_DOLLAR_VOLUME
+                dollar_volume
+                >= MIN_DOLLAR_VOLUME
             ):
+
                 ranked.append(
                     (
                         symbol,
@@ -225,7 +325,9 @@ def liquid_universe(symbols):
                     )
                 )
 
-        time.sleep(0.05)
+        time.sleep(
+            0.05
+        )
 
     ranked.sort(
         key=lambda item: item[1],
@@ -235,7 +337,9 @@ def liquid_universe(symbols):
     keep = {
         symbol
         for symbol, _, _
-        in ranked[:MAX_LIVE_UNIVERSE]
+        in ranked[
+            :MAX_LIVE_UNIVERSE
+        ]
     }
 
     keep.update(
@@ -255,25 +359,40 @@ def liquid_universe(symbols):
         if symbol in keep
     }
 
-    return list(keep), metadata
+    return (
+        list(keep),
+        metadata
+    )
 
 
 # ============================================================
-# BARS
+# GET BARS
 # ============================================================
 
 def get_batch_bars(
     symbols,
     days=3
 ):
+
     if not symbols:
         return {}
 
-    end = datetime.now(UTC)
-    start = end - timedelta(days=days)
+    end = datetime.now(
+        UTC
+    )
+
+    start = (
+        end
+        -
+        timedelta(
+            days=days
+        )
+    )
 
     params = {
-        "symbols": ",".join(symbols),
+        "symbols": ",".join(
+            symbols
+        ),
         "timeframe": TIMEFRAME,
         "start": start.isoformat(),
         "end": end.isoformat(),
@@ -285,16 +404,26 @@ def get_batch_bars(
 
     output = {
         symbol: []
-        for symbol in symbols
+        for symbol
+        in symbols
     }
 
     page_token = None
 
     while True:
+
         if page_token:
-            params["page_token"] = page_token
+
+            params[
+                "page_token"
+            ] = page_token
+
         else:
-            params.pop("page_token", None)
+
+            params.pop(
+                "page_token",
+                None
+            )
 
         data = req(
             "GET",
@@ -303,12 +432,16 @@ def get_batch_bars(
         )
 
         for symbol, bars in (
-            data.get("bars") or {}
+            data.get("bars")
+            or {}
         ).items():
+
             output.setdefault(
                 symbol,
                 []
-            ).extend(bars)
+            ).extend(
+                bars
+            )
 
         page_token = data.get(
             "next_page_token"
@@ -320,7 +453,12 @@ def get_batch_bars(
     return output
 
 
+# ============================================================
+# DATAFRAME
+# ============================================================
+
 def to_df(bars):
+
     if not bars:
         return pd.DataFrame()
 
@@ -346,18 +484,26 @@ def to_df(bars):
         "volume",
     }
 
-    if not required.issubset(df.columns):
+    if not required.issubset(
+        df.columns
+    ):
         return pd.DataFrame()
 
-    df["timestamp"] = pd.to_datetime(
+    df[
+        "timestamp"
+    ] = pd.to_datetime(
         df["timestamp"],
-        utc=True
+        utc=True,
     )
 
     df = (
         df
-        .set_index("timestamp")
-        .tz_convert(NY)
+        .set_index(
+            "timestamp"
+        )
+        .tz_convert(
+            NY
+        )
         .sort_index()
     )
 
@@ -368,9 +514,12 @@ def to_df(bars):
         "close",
         "volume",
     ]:
-        df[column] = pd.to_numeric(
+
+        df[
+            column
+        ] = pd.to_numeric(
             df[column],
-            errors="coerce"
+            errors="coerce",
         )
 
     return df.dropna(
@@ -388,35 +537,64 @@ def to_df(bars):
 # ============================================================
 
 def add_indicators(df):
+
     df = df.copy()
 
-    df["ema5"] = df["close"].ewm(
+    df[
+        "ema5"
+    ] = df["close"].ewm(
         span=EMA_FAST,
         adjust=False
     ).mean()
 
-    df["ema9"] = df["close"].ewm(
+    df[
+        "ema9"
+    ] = df["close"].ewm(
         span=EMA_SLOW,
         adjust=False
     ).mean()
 
-    df["ema30"] = df["close"].ewm(
+    df[
+        "ema30"
+    ] = df["close"].ewm(
         span=EMA_TREND,
         adjust=False
     ).mean()
 
-    previous_close = df["close"].shift(1)
+    previous_close = (
+        df["close"].shift(
+            1
+        )
+    )
 
     true_range = pd.concat(
         [
-            (df["high"] - df["low"]).abs(),
-            (df["high"] - previous_close).abs(),
-            (df["low"] - previous_close).abs(),
-        ],
-        axis=1
-    ).max(axis=1)
+            (
+                df["high"]
+                -
+                df["low"]
+            ).abs(),
 
-    df["atr"] = true_range.rolling(
+            (
+                df["high"]
+                -
+                previous_close
+            ).abs(),
+
+            (
+                df["low"]
+                -
+                previous_close
+            ).abs(),
+        ],
+        axis=1,
+    ).max(
+        axis=1
+    )
+
+    df[
+        "atr"
+    ] = true_range.rolling(
         14,
         min_periods=5
     ).mean()
@@ -428,26 +606,43 @@ def add_indicators(df):
 
     typical_price = (
         df["high"]
-        + df["low"]
-        + df["close"]
+        +
+        df["low"]
+        +
+        df["close"]
     ) / 3
 
     cumulative_volume = (
         df["volume"]
-        .groupby(dates)
+        .groupby(
+            dates
+        )
         .cumsum()
-        .replace(0, math.nan)
+        .replace(
+            0,
+            math.nan
+        )
     )
 
-    df["vwap"] = (
-        (typical_price * df["volume"])
-        .groupby(dates)
+    df[
+        "vwap"
+    ] = (
+        (
+            typical_price
+            *
+            df["volume"]
+        )
+        .groupby(
+            dates
+        )
         .cumsum()
         /
         cumulative_volume
     )
 
-    df["vol_sma20"] = (
+    df[
+        "vol_sma20"
+    ] = (
         df["volume"]
         .rolling(
             20,
@@ -459,16 +654,89 @@ def add_indicators(df):
     return df
 
 
+# ============================================================
+# CLOSED CANDLES ONLY
+# ============================================================
+
 def closed_only(df):
+
     if df.empty:
         return df
 
-    now = datetime.now(NY)
+    now = datetime.now(
+        NY
+    )
 
     return df[
         df.index
-        + pd.Timedelta(minutes=4)
+        +
+        pd.Timedelta(
+            minutes=4
+        )
         <= now
+    ]
+
+
+# ============================================================
+# LEVEL CLUSTERS
+# ============================================================
+
+def cluster_levels(
+    values,
+    tolerance
+):
+
+    values = sorted(
+        float(value)
+        for value in values
+        if pd.notna(
+            value
+        )
+    )
+
+    clusters = []
+
+    for value in values:
+
+        if (
+            not clusters
+            or
+            abs(
+                value
+                -
+                (
+                    sum(
+                        clusters[-1]
+                    )
+                    /
+                    len(
+                        clusters[-1]
+                    )
+                )
+            )
+            >
+            tolerance
+        ):
+
+            clusters.append(
+                [value]
+            )
+
+        else:
+
+            clusters[-1].append(
+                value
+            )
+
+    return [
+        (
+            sum(cluster)
+            /
+            len(cluster),
+            len(cluster),
+        )
+        for cluster
+        in clusters
     ]
 
 
@@ -476,48 +744,12 @@ def closed_only(df):
 # SUPPORT / RESISTANCE
 # ============================================================
 
-def cluster_levels(
-    values,
-    tolerance
-):
-    values = sorted(
-        float(value)
-        for value in values
-        if pd.notna(value)
-    )
-
-    clusters = []
-
-    for value in values:
-        if (
-            not clusters
-            or
-            abs(
-                value
-                - sum(clusters[-1])
-                / len(clusters[-1])
-            )
-            > tolerance
-        ):
-            clusters.append([value])
-        else:
-            clusters[-1].append(value)
-
-    return [
-        (
-            sum(cluster)
-            / len(cluster),
-            len(cluster),
-        )
-        for cluster in clusters
-    ]
-
-
 def levels_from_df(
     df,
     price,
     atr
 ):
+
     window = df.tail(
         LEVEL_LOOKBACK
     )
@@ -529,27 +761,42 @@ def levels_from_df(
         2,
         len(window) - 2
     ):
+
         low = float(
-            window["low"].iloc[i]
+            window["low"].iloc[
+                i
+            ]
         )
 
         high = float(
-            window["high"].iloc[i]
+            window["high"].iloc[
+                i
+            ]
         )
 
         if low <= float(
             window["low"]
-            .iloc[i - 2:i + 3]
+            .iloc[
+                i - 2:i + 3
+            ]
             .min()
         ):
-            lows.append(low)
+
+            lows.append(
+                low
+            )
 
         if high >= float(
             window["high"]
-            .iloc[i - 2:i + 3]
+            .iloc[
+                i - 2:i + 3
+            ]
             .max()
         ):
-            highs.append(high)
+
+            highs.append(
+                high
+            )
 
     tolerance = max(
         price * 0.0008,
@@ -568,26 +815,40 @@ def levels_from_df(
     )
 
     below = [
-        (level, touches)
-        for level, touches in supports
+        (
+            level,
+            touches
+        )
+        for level, touches
+        in supports
         if level < price
     ]
 
     above = [
-        (level, touches)
-        for level, touches in resistances
+        (
+            level,
+            touches
+        )
+        for level, touches
+        in resistances
         if level > price
     ]
 
     support = max(
         below,
-        default=(None, 0),
+        default=(
+            None,
+            0
+        ),
         key=lambda item: item[0]
     )
 
     resistance = min(
         above,
-        default=(None, 0),
+        default=(
+            None,
+            0
+        ),
         key=lambda item: item[0]
     )
 
@@ -598,38 +859,57 @@ def levels_from_df(
     )
 
 
+# ============================================================
+# PREVIOUS DAY LEVELS
+# ============================================================
+
 def previous_day_levels(
     df,
     today
 ):
+
     previous = df[
-        df.index.date < today
+        df.index.date
+        <
+        today
     ]
 
     if previous.empty:
-        return None, None
+
+        return (
+            None,
+            None
+        )
 
     previous_date = (
-        previous.index.date[-1]
+        previous.index.date[
+            -1
+        ]
     )
 
     previous_day = previous[
         previous.index.date
-        == previous_date
+        ==
+        previous_date
     ]
 
     return (
         float(
-            previous_day["high"].max()
+            previous_day[
+                "high"
+            ].max()
         ),
+
         float(
-            previous_day["low"].min()
+            previous_day[
+                "low"
+            ].min()
         )
     )
 
 
 # ============================================================
-# ANALYZE
+# ANALYZE SYMBOL
 # ============================================================
 
 def analyze(
@@ -637,9 +917,12 @@ def analyze(
     raw,
     metadata
 ):
+
     df = closed_only(
         add_indicators(
-            to_df(raw)
+            to_df(
+                raw
+            )
         )
     )
 
@@ -651,22 +934,35 @@ def analyze(
     ).date()
 
     today_df = df[
-        df.index.date == today
+        df.index.date
+        ==
+        today
     ]
 
-    if len(today_df) < 3:
+    if len(
+        today_df
+    ) < 3:
         return None
 
-    row = today_df.iloc[-1]
-    previous = today_df.iloc[-2]
+    row = today_df.iloc[
+        -1
+    ]
+
+    previous = today_df.iloc[
+        -2
+    ]
 
     price = float(
-        row["close"]
+        row[
+            "close"
+        ]
     )
 
     atr = float(
         row["atr"]
-        if pd.notna(row["atr"])
+        if pd.notna(
+            row["atr"]
+        )
         else max(
             price * 0.003,
             0.05
@@ -675,13 +971,16 @@ def analyze(
 
     vwap = float(
         row["vwap"]
-        if pd.notna(row["vwap"])
+        if pd.notna(
+            row["vwap"]
+        )
         else price
     )
 
     rvol = float(
         row["volume"]
-        / row["vol_sma20"]
+        /
+        row["vol_sma20"]
         if (
             pd.notna(
                 row["vol_sma20"]
@@ -689,24 +988,34 @@ def analyze(
             and
             row["vol_sma20"]
         )
-        else 1.0
+        else
+        1.0
     )
+
+
+    # ========================================================
+    # PREMARKET LEVELS
+    # ========================================================
 
     premarket = today_df[
         (
             today_df.index.time
-            >= PREMARKET_START
+            >=
+            PREMARKET_START
         )
         &
         (
             today_df.index.time
-            < PREMARKET_END
+            <
+            PREMARKET_END
         )
     ]
 
     pm_high = (
         float(
-            premarket["high"].max()
+            premarket[
+                "high"
+            ].max()
         )
         if not premarket.empty
         else None
@@ -714,11 +1023,18 @@ def analyze(
 
     pm_low = (
         float(
-            premarket["low"].min()
+            premarket[
+                "low"
+            ].min()
         )
         if not premarket.empty
         else None
     )
+
+
+    # ========================================================
+    # PREVIOUS DAY
+    # ========================================================
 
     previous_day_high, previous_day_low = (
         previous_day_levels(
@@ -726,6 +1042,11 @@ def analyze(
             today
         )
     )
+
+
+    # ========================================================
+    # SUPPORT / RESISTANCE
+    # ========================================================
 
     support, resistance, tolerance = (
         levels_from_df(
@@ -735,58 +1056,103 @@ def analyze(
         )
     )
 
-    support_level, support_touches = support
-    resistance_level, resistance_touches = resistance
+    support_level, support_touches = (
+        support
+    )
+
+    resistance_level, resistance_touches = (
+        resistance
+    )
+
 
     if (
         pm_low
-        and pm_low < price
-        and (
+        and
+        pm_low < price
+        and
+        (
             support_level is None
-            or pm_low > support_level
+            or
+            pm_low > support_level
         )
     ):
+
         support_level = pm_low
         support_touches = 3
 
+
     if (
         previous_day_low
-        and previous_day_low < price
-        and (
+        and
+        previous_day_low < price
+        and
+        (
             support_level is None
-            or previous_day_low > support_level
+            or
+            previous_day_low
+            >
+            support_level
         )
     ):
-        support_level = previous_day_low
+
+        support_level = (
+            previous_day_low
+        )
+
         support_touches = max(
             support_touches,
             2
         )
 
+
     if (
         pm_high
-        and pm_high > price
-        and (
+        and
+        pm_high > price
+        and
+        (
             resistance_level is None
-            or pm_high < resistance_level
+            or
+            pm_high
+            <
+            resistance_level
         )
     ):
-        resistance_level = pm_high
+
+        resistance_level = (
+            pm_high
+        )
+
         resistance_touches = 3
+
 
     if (
         previous_day_high
-        and previous_day_high > price
-        and (
+        and
+        previous_day_high > price
+        and
+        (
             resistance_level is None
-            or previous_day_high < resistance_level
+            or
+            previous_day_high
+            <
+            resistance_level
         )
     ):
-        resistance_level = previous_day_high
+
+        resistance_level = (
+            previous_day_high
+        )
+
         resistance_touches = max(
             resistance_touches,
             2
         )
+
+
+    # ========================================================
+    # TREND
+    # ========================================================
 
     bull = (
         row["ema5"]
@@ -808,18 +1174,26 @@ def analyze(
         price
         -
         float(
-            today_df["close"].iloc[-3]
+            today_df[
+                "close"
+            ].iloc[-3]
         )
     ) / max(
         atr,
         0.000001
     )
 
+
+    # ========================================================
+    # CALL / PUT
+    # ========================================================
+
     if (
         bull
         and
         price > vwap
     ):
+
         direction = "CALL"
 
     elif (
@@ -827,19 +1201,25 @@ def analyze(
         and
         price < vwap
     ):
+
         direction = "PUT"
 
     elif momentum > 0.35:
+
         direction = "CALL"
 
     elif momentum < -0.35:
+
         direction = "PUT"
 
     else:
-        direction = "NONE"
 
-    if direction == "NONE":
         return None
+
+
+    # ========================================================
+    # ENTRY TRIGGER
+    # ========================================================
 
     trigger = (
         resistance_level
@@ -850,23 +1230,38 @@ def analyze(
     if trigger is None:
         return None
 
+
+    # ========================================================
+    # DISTANCE TO LEVEL
+    # ========================================================
+
     distance = abs(
-        price - trigger
+        price
+        -
+        trigger
     )
 
     proximity = max(
         0.0,
         1.0
         -
-        distance
-        /
-        max(
-            atr * 1.25,
-            0.05
+        (
+            distance
+            /
+            max(
+                atr * 1.25,
+                0.05
+            )
         )
     )
 
+
+    # ========================================================
+    # TARGET
+    # ========================================================
+
     if direction == "CALL":
+
         above = sorted(
             [
                 level
@@ -899,6 +1294,7 @@ def analyze(
         )
 
     else:
+
         below = sorted(
             [
                 level
@@ -931,8 +1327,15 @@ def analyze(
             )
         )
 
+
+    # ========================================================
+    # SCORE
+    # ========================================================
+
     score = 0.0
 
+
+    # EMA TREND
     if (
         (
             direction == "CALL"
@@ -944,21 +1347,29 @@ def analyze(
             and bear
         )
     ):
+
         score += 25
 
+
+    # VWAP
     if (
         (
             direction == "CALL"
-            and price > vwap
+            and
+            price > vwap
         )
         or
         (
             direction == "PUT"
-            and price < vwap
+            and
+            price < vwap
         )
     ):
+
         score += 15
 
+
+    # RVOL
     score += min(
         max(
             rvol - 0.8,
@@ -969,17 +1380,27 @@ def analyze(
         1
     ) * 15
 
+
+    # MOMENTUM
     score += min(
-        abs(momentum)
+        abs(
+            momentum
+        )
         /
         1.2,
         1
     ) * 10
 
+
+    # LEVEL PROXIMITY
     score += (
-        proximity * 20
+        proximity
+        *
+        20
     )
 
+
+    # LEVEL STRENGTH
     touches = (
         resistance_touches
         if direction == "CALL"
@@ -987,20 +1408,26 @@ def analyze(
     )
 
     score += min(
-        touches / 3,
+        touches
+        /
+        3,
         1
     ) * 10
 
-    room = (
-        abs(
-            target - trigger
-        )
-        if target
-        else 0
+
+    # ROOM TO TARGET
+    room = abs(
+        target
+        -
+        trigger
     )
 
-    if room >= atr * 0.6:
+    if room >= (
+        atr * 0.6
+    ):
+
         score += 5
+
 
     score = round(
         min(
@@ -1010,156 +1437,253 @@ def analyze(
         1
     )
 
+
+    # ========================================================
+    # BREAK CONFIRMATION
+    # ========================================================
+
     previous_close = float(
-        previous["close"]
+        previous[
+            "close"
+        ]
     )
 
     if direction == "CALL":
+
         crossed = (
-            previous_close <= trigger
+            previous_close
+            <=
+            trigger
             and
-            price > trigger
+            price
+            >
+            trigger
         )
 
         if crossed:
-            status = "BREAK_CONFIRMED"
-        elif price <= trigger + tolerance:
-            status = "WAITING_FOR_BREAK"
+
+            status = (
+                "BREAK_CONFIRMED"
+            )
+
+        elif price <= (
+            trigger
+            +
+            tolerance
+        ):
+
+            status = (
+                "WAITING_FOR_BREAK"
+            )
+
         else:
-            status = "ABOVE_LEVEL"
+
+            status = (
+                "ABOVE_LEVEL"
+            )
 
     else:
+
         crossed = (
-            previous_close >= trigger
+            previous_close
+            >=
+            trigger
             and
-            price < trigger
+            price
+            <
+            trigger
         )
 
         if crossed:
-            status = "BREAK_CONFIRMED"
-        elif price >= trigger - tolerance:
-            status = "WAITING_FOR_BREAK"
+
+            status = (
+                "BREAK_CONFIRMED"
+            )
+
+        elif price >= (
+            trigger
+            -
+            tolerance
+        ):
+
+            status = (
+                "WAITING_FOR_BREAK"
+            )
+
         else:
-            status = "BELOW_LEVEL"
+
+            status = (
+                "BELOW_LEVEL"
+            )
+
 
     return {
-        "symbol": symbol,
-        "direction": direction,
-        "score": score,
-        "status": status,
-        "price": round(
-            price,
-            4
-        ),
-        "trigger": round(
-            trigger,
-            4
-        ),
-        "support": (
+
+        "symbol":
+            symbol,
+
+        "direction":
+            direction,
+
+        "score":
+            score,
+
+        "status":
+            status,
+
+        "price":
             round(
-                support_level,
+                price,
                 4
-            )
-            if support_level
-            else None
-        ),
-        "resistance": (
+            ),
+
+        "trigger":
             round(
-                resistance_level,
+                trigger,
                 4
-            )
-            if resistance_level
-            else None
-        ),
-        "target": (
+            ),
+
+        "support":
+            (
+                round(
+                    support_level,
+                    4
+                )
+                if support_level
+                is not None
+                else None
+            ),
+
+        "resistance":
+            (
+                round(
+                    resistance_level,
+                    4
+                )
+                if resistance_level
+                is not None
+                else None
+            ),
+
+        "target":
             round(
                 target,
                 4
-            )
-            if target
-            else None
-        ),
-        "ema5": round(
-            float(
-                row["ema5"]
             ),
-            4
-        ),
-        "ema9": round(
-            float(
-                row["ema9"]
+
+        "ema5":
+            round(
+                float(
+                    row["ema5"]
+                ),
+                4
             ),
-            4
-        ),
-        "ema30": round(
-            float(
-                row["ema30"]
+
+        "ema9":
+            round(
+                float(
+                    row["ema9"]
+                ),
+                4
             ),
-            4
-        ),
-        "vwap": round(
-            vwap,
-            4
-        ),
-        "atr": round(
-            atr,
-            4
-        ),
-        "rvol": round(
-            rvol,
-            2
-        ),
-        "dollar_volume": round(
-            float(
-                metadata.get(
-                    symbol,
-                    {}
-                ).get(
-                    "dollar_volume",
-                    0
-                )
+
+        "ema30":
+            round(
+                float(
+                    row["ema30"]
+                ),
+                4
             ),
-            2
-        ),
-        "bar_time": (
-            today_df.index[-1]
-            .isoformat()
-        ),
-        "touches": int(
-            touches
-        ),
+
+        "vwap":
+            round(
+                vwap,
+                4
+            ),
+
+        "atr":
+            round(
+                atr,
+                4
+            ),
+
+        "rvol":
+            round(
+                rvol,
+                2
+            ),
+
+        "dollar_volume":
+            round(
+                float(
+                    metadata.get(
+                        symbol,
+                        {}
+                    ).get(
+                        "dollar_volume",
+                        0
+                    )
+                ),
+                2
+            ),
+
+        "bar_time":
+            today_df.index[
+                -1
+            ].isoformat(),
+
+        "touches":
+            int(
+                touches
+            ),
     }
 
 
 # ============================================================
-# SCAN
+# RUN SCAN
 # ============================================================
 
 def run_scan():
+
     with lock:
+
         STATE.update(
             status="SCANNING",
             error=None
         )
 
-    symbols = get_universe()
-
-    live, metadata = liquid_universe(
-        symbols
+    symbols = (
+        get_universe()
     )
 
-    results = []
+    live, metadata = (
+        liquid_universe(
+            symbols
+        )
+    )
+
+    all_results = []
+
+
+    # ========================================================
+    # ANALYZE ALL LIQUID SYMBOLS
+    # ========================================================
 
     for batch in chunks(
         live,
         BAR_BATCH
     ):
-        bars = get_batch_bars(
-            batch
+
+        bars = (
+            get_batch_bars(
+                batch
+            )
         )
 
         for symbol in batch:
+
             try:
+
                 item = analyze(
                     symbol,
                     bars.get(
@@ -1169,26 +1693,33 @@ def run_scan():
                     metadata
                 )
 
-                if (
-                    item
-                    and
-                    item["score"]
-                    >= MIN_SETUP_SCORE
-                ):
-                    results.append(
+                # IMPORTANT:
+                # Keep valid setups even if they score under threshold.
+                # This allows near-miss display.
+                if item:
+
+                    all_results.append(
                         item
                     )
 
             except Exception as error:
+
                 logging.warning(
                     "%s analyze error: %s",
                     symbol,
                     error
                 )
 
-        time.sleep(0.05)
+        time.sleep(
+            0.05
+        )
 
-    results.sort(
+
+    # ========================================================
+    # SORT BEST FIRST
+    # ========================================================
+
+    all_results.sort(
         key=lambda item: (
             item["score"],
             item["dollar_volume"]
@@ -1196,52 +1727,131 @@ def run_scan():
         reverse=True
     )
 
-    watchlist = results[
+
+    # ========================================================
+    # QUALIFIED
+    #
+    # ONLY THESE ARE SENT TO main.py
+    # ========================================================
+
+    qualified = [
+        item
+        for item
+        in all_results
+        if item[
+            "score"
+        ]
+        >=
+        MIN_SETUP_SCORE
+    ]
+
+    watchlist = qualified[
         :WATCHLIST_SIZE
     ]
 
+
+    for item in watchlist:
+
+        item[
+            "qualification"
+        ] = "QUALIFIED"
+
+
+    # ========================================================
+    # NEAR MISSES
+    #
+    # WEBSITE ONLY
+    # NOT TRADEABLE BY main.py
+    # ========================================================
+
+    near_misses = [
+        item
+        for item
+        in all_results
+        if item[
+            "score"
+        ]
+        <
+        MIN_SETUP_SCORE
+    ][
+        :NEAR_MISS_SIZE
+    ]
+
+
+    for item in near_misses:
+
+        item[
+            "qualification"
+        ] = "WATCH_ONLY"
+
+
+    # ========================================================
+    # SAVE STATE
+    # ========================================================
+
     with lock:
+
         STATE.update(
+
             status="READY",
+
             last_scan=datetime.now(
                 NY
             ).isoformat(),
+
             universe_count=len(
                 symbols
             ),
+
             liquid_count=len(
                 live
             ),
+
             watchlist_count=len(
                 watchlist
             ),
+
             watchlist=watchlist,
+
+            near_miss_count=len(
+                near_misses
+            ),
+
+            near_misses=near_misses,
+
             error=None
         )
 
+
     logging.info(
-        "SCAN READY | universe=%s | liquid=%s | watch=%s",
+        "SCAN READY | universe=%s | liquid=%s | qualified=%s | near_misses=%s",
         len(symbols),
         len(live),
-        len(watchlist)
+        len(watchlist),
+        len(near_misses)
     )
 
 
 # ============================================================
-# LOOP
+# SCANNER LOOP
 # ============================================================
 
 def loop():
+
     while True:
+
         try:
+
             run_scan()
 
         except Exception as error:
+
             logging.exception(
                 "SCAN FAILED"
             )
 
             with lock:
+
                 STATE.update(
                     status="ERROR",
                     error=str(
@@ -1255,28 +1865,35 @@ def loop():
 
 
 # ============================================================
-# MOBILE WATCHLIST WEBSITE
+# WEBSITE
 # ============================================================
 
 HTML = """
 <!doctype html>
+
 <html>
 
 <head>
 
 <meta
-    name="viewport"
-    content="width=device-width,initial-scale=1,viewport-fit=cover"
+name="viewport"
+content="width=device-width,initial-scale=1,viewport-fit=cover"
 >
 
 <meta
-    http-equiv="refresh"
-    content="20"
+http-equiv="refresh"
+content="20"
+>
+
+<meta
+name="theme-color"
+content="#080d14"
 >
 
 <title>
-90% AI Trade Scanner
+AI Trade Setup Scanner
 </title>
+
 
 <style>
 
@@ -1285,251 +1902,658 @@ HTML = """
 }
 
 body{
+
     margin:0;
-    background:#080d14;
+
+    background:
+        linear-gradient(
+            180deg,
+            #0d1622 0%,
+            #080d14 35%,
+            #05080d 100%
+        );
+
     color:#f4f7fb;
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+
+    font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        Arial,
+        sans-serif;
+
     min-height:100vh;
 }
 
+
 .container{
+
     max-width:950px;
+
     margin:auto;
-    padding:18px 13px 35px;
+
+    padding:
+        18px
+        13px
+        35px;
 }
+
 
 .header{
+
     display:flex;
-    justify-content:space-between;
-    align-items:flex-start;
+
+    justify-content:
+        space-between;
+
+    align-items:
+        flex-start;
+
     gap:12px;
-    margin-bottom:15px;
+
+    margin-bottom:
+        15px;
 }
+
 
 .title{
-    font-size:27px;
-    font-weight:950;
+
+    font-size:
+        27px;
+
+    font-weight:
+        950;
 }
+
 
 .subtitle{
-    color:#8da0b5;
-    font-size:12px;
-    margin-top:5px;
-    line-height:1.4;
+
+    color:
+        #8da0b5;
+
+    font-size:
+        12px;
+
+    margin-top:
+        5px;
+
+    line-height:
+        1.4;
 }
+
 
 .ready{
-    background:#10281e;
-    border:1px solid #275a40;
-    color:#54df8d;
-    border-radius:999px;
-    padding:7px 10px;
-    font-size:11px;
-    font-weight:900;
+
+    flex:
+        0 0 auto;
+
+    background:
+        #10281e;
+
+    border:
+        1px solid
+        #275a40;
+
+    color:
+        #54df8d;
+
+    border-radius:
+        999px;
+
+    padding:
+        7px
+        10px;
+
+    font-size:
+        11px;
+
+    font-weight:
+        900;
 }
+
 
 .stats{
+
     display:grid;
-    grid-template-columns:repeat(3,1fr);
-    gap:7px;
-    margin-bottom:15px;
+
+    grid-template-columns:
+        repeat(
+            4,
+            1fr
+        );
+
+    gap:
+        6px;
+
+    margin-bottom:
+        15px;
 }
+
 
 .stat{
-    background:#111923;
-    border:1px solid #213044;
-    border-radius:13px;
-    padding:10px;
+
+    background:
+        #111923;
+
+    border:
+        1px solid
+        #213044;
+
+    border-radius:
+        13px;
+
+    padding:
+        9px;
 }
+
 
 .stat-label{
-    color:#7d91a7;
-    font-size:9px;
-    text-transform:uppercase;
+
+    color:
+        #7d91a7;
+
+    font-size:
+        8px;
+
+    text-transform:
+        uppercase;
 }
+
 
 .stat-value{
-    margin-top:4px;
-    font-size:19px;
-    font-weight:900;
+
+    margin-top:
+        4px;
+
+    font-size:
+        18px;
+
+    font-weight:
+        900;
 }
+
+
+.section-title{
+
+    margin-top:
+        18px;
+
+    margin-bottom:
+        4px;
+
+    font-size:
+        20px;
+
+    font-weight:
+        950;
+}
+
+
+.section-subtitle{
+
+    color:
+        #8195ab;
+
+    font-size:
+        11px;
+
+    line-height:
+        1.4;
+
+    margin-bottom:
+        12px;
+}
+
 
 .card{
-    background:#111923;
-    border:1px solid #26384e;
-    border-radius:17px;
-    padding:14px;
-    margin:11px 0;
+
+    background:
+        linear-gradient(
+            180deg,
+            #141e2a,
+            #0d141e
+        );
+
+    border:
+        1px solid
+        #26384e;
+
+    border-radius:
+        17px;
+
+    padding:
+        14px;
+
+    margin:
+        11px 0;
 }
+
 
 .card.call{
-    border-left:4px solid #43dc81;
+
+    border-left:
+        4px solid
+        #43dc81;
 }
+
 
 .card.put{
-    border-left:4px solid #ff626d;
+
+    border-left:
+        4px solid
+        #ff626d;
 }
+
+
+.card.near{
+
+    opacity:
+        0.88;
+}
+
 
 .top{
+
     display:flex;
-    justify-content:space-between;
-    align-items:flex-start;
+
+    justify-content:
+        space-between;
+
+    align-items:
+        flex-start;
 }
+
 
 .symbol{
-    font-size:29px;
-    font-weight:950;
+
+    font-size:
+        29px;
+
+    font-weight:
+        950;
 }
+
 
 .direction{
-    margin-top:6px;
-    font-size:12px;
-    font-weight:900;
+
+    margin-top:
+        6px;
+
+    font-size:
+        12px;
+
+    font-weight:
+        900;
 }
+
 
 .call-text{
-    color:#48df87;
+
+    color:
+        #48df87;
 }
+
 
 .put-text{
-    color:#ff6d77;
+
+    color:
+        #ff6d77;
 }
+
 
 .score{
-    text-align:right;
-    font-size:28px;
-    font-weight:950;
+
+    text-align:
+        right;
+
+    font-size:
+        28px;
+
+    font-weight:
+        950;
 }
+
 
 .score-label{
-    color:#7c91a7;
-    font-size:8px;
-    text-align:right;
+
+    color:
+        #7c91a7;
+
+    font-size:
+        8px;
+
+    margin-top:
+        3px;
+
+    text-align:
+        right;
 }
+
 
 .status{
-    display:inline-block;
-    margin-top:11px;
-    background:#192638;
-    border:1px solid #29405a;
-    border-radius:9px;
-    padding:6px 9px;
-    color:#c5d4e4;
-    font-size:10px;
-    font-weight:900;
+
+    display:
+        inline-block;
+
+    margin-top:
+        11px;
+
+    background:
+        #192638;
+
+    border:
+        1px solid
+        #29405a;
+
+    border-radius:
+        9px;
+
+    padding:
+        6px
+        9px;
+
+    color:
+        #c5d4e4;
+
+    font-size:
+        10px;
+
+    font-weight:
+        900;
 }
+
 
 .confirmed{
-    background:#2c2613;
-    border-color:#66551d;
-    color:#ffd25e;
+
+    background:
+        #2c2613;
+
+    border-color:
+        #66551d;
+
+    color:
+        #ffd25e;
 }
+
+
+.watch-only{
+
+    background:
+        #252117;
+
+    border-color:
+        #665c2d;
+
+    color:
+        #ffd76b;
+}
+
 
 .levels{
+
     display:grid;
-    grid-template-columns:repeat(2,minmax(0,1fr));
-    gap:7px;
-    margin-top:12px;
+
+    grid-template-columns:
+        repeat(
+            2,
+            minmax(
+                0,
+                1fr
+            )
+        );
+
+    gap:
+        7px;
+
+    margin-top:
+        12px;
 }
+
 
 .level{
-    background:#091019;
-    border:1px solid #1e2c3d;
-    border-radius:11px;
-    padding:9px;
+
+    background:
+        #091019;
+
+    border:
+        1px solid
+        #1e2c3d;
+
+    border-radius:
+        11px;
+
+    padding:
+        9px;
 }
+
 
 .label{
-    color:#798da4;
-    font-size:8px;
-    text-transform:uppercase;
+
+    color:
+        #798da4;
+
+    font-size:
+        8px;
+
+    text-transform:
+        uppercase;
 }
+
 
 .value{
-    margin-top:3px;
-    font-size:16px;
-    font-weight:850;
+
+    margin-top:
+        3px;
+
+    font-size:
+        16px;
+
+    font-weight:
+        850;
 }
+
 
 .entry{
-    color:#ffd15c;
+
+    color:
+        #ffd15c;
 }
+
 
 .support{
-    color:#62e09a;
+
+    color:
+        #62e09a;
 }
+
 
 .resistance{
-    color:#ff7e87;
+
+    color:
+        #ff7e87;
 }
+
 
 .target{
-    color:#6cd2ff;
+
+    color:
+        #6cd2ff;
 }
+
 
 .indicators{
+
     display:grid;
-    grid-template-columns:repeat(4,minmax(0,1fr));
-    gap:5px;
-    margin-top:9px;
+
+    grid-template-columns:
+        repeat(
+            4,
+            minmax(
+                0,
+                1fr
+            )
+        );
+
+    gap:
+        5px;
+
+    margin-top:
+        9px;
 }
+
 
 .indicator{
-    background:#151f2b;
-    border-radius:8px;
-    padding:7px 3px;
-    text-align:center;
+
+    background:
+        #151f2b;
+
+    border-radius:
+        8px;
+
+    padding:
+        7px
+        3px;
+
+    text-align:
+        center;
 }
+
 
 .indicator-label{
-    color:#74899f;
-    font-size:8px;
+
+    color:
+        #74899f;
+
+    font-size:
+        8px;
 }
+
 
 .indicator-value{
-    margin-top:2px;
-    font-size:11px;
-    font-weight:850;
+
+    margin-top:
+        2px;
+
+    font-size:
+        11px;
+
+    font-weight:
+        850;
 }
+
 
 .empty{
-    background:#111923;
-    border:1px solid #26384e;
-    border-radius:15px;
-    padding:24px 16px;
-    text-align:center;
-    color:#91a4b9;
-    line-height:1.5;
+
+    background:
+        #111923;
+
+    border:
+        1px solid
+        #26384e;
+
+    border-radius:
+        15px;
+
+    padding:
+        20px
+        16px;
+
+    text-align:
+        center;
+
+    color:
+        #91a4b9;
+
+    line-height:
+        1.5;
 }
+
 
 .error{
-    margin:10px 0;
-    background:#2a1218;
-    border:1px solid #68313b;
-    border-radius:10px;
-    padding:10px;
-    color:#ff8a94;
-    font-size:11px;
+
+    margin:
+        10px 0;
+
+    background:
+        #2a1218;
+
+    border:
+        1px solid
+        #68313b;
+
+    border-radius:
+        10px;
+
+    padding:
+        10px;
+
+    color:
+        #ff8a94;
+
+    font-size:
+        11px;
 }
+
 
 .footer{
-    margin-top:15px;
-    color:#637990;
-    font-size:9px;
-    text-align:center;
-    line-height:1.6;
+
+    margin-top:
+        22px;
+
+    color:
+        #637990;
+
+    font-size:
+        9px;
+
+    text-align:
+        center;
+
+    line-height:
+        1.6;
 }
 
-@media(min-width:700px){
+
+@media(
+    max-width:450px
+){
+
+    .stats{
+
+        grid-template-columns:
+            repeat(
+                2,
+                1fr
+            );
+    }
+}
+
+
+@media(
+    min-width:700px
+){
 
     .cards{
+
         display:grid;
-        grid-template-columns:repeat(2,minmax(0,1fr));
-        gap:11px;
+
+        grid-template-columns:
+            repeat(
+                2,
+                minmax(
+                    0,
+                    1fr
+                )
+            );
+
+        gap:
+            11px;
     }
 
     .card{
-        margin:0;
+
+        margin:
+            0;
     }
 }
 
@@ -1537,43 +2561,70 @@ body{
 
 </head>
 
+
 <body>
+
 
 <div class="container">
 
 
 <div class="header">
 
+
 <div>
 
 <div class="title">
-90% AI Trade Scanner
+AI Trade Setup Scanner
 </div>
 
 <div class="subtitle">
-CALL / PUT candidates with support,
-resistance, entry trigger and target
+
+CALL / PUT candidates ranked by setup quality.
+Qualified setups and watch-only near misses are kept separate.
+
 </div>
 
 </div>
+
 
 <div class="ready">
+
 {{ state.status }}
+
 </div>
+
 
 </div>
 
 
 <div class="stats">
 
+
 <div class="stat">
 
 <div class="stat-label">
-WATCHING
+QUALIFIED
 </div>
 
 <div class="stat-value">
+
 {{ state.watchlist_count }}
+
+</div>
+
+</div>
+
+
+<div class="stat">
+
+<div class="stat-label">
+NEAR MISSES
+</div>
+
+<div class="stat-value">
+
+{{ state.near_miss_count }}
+
 </div>
 
 </div>
@@ -1586,7 +2637,9 @@ LIQUID
 </div>
 
 <div class="stat-value">
+
 {{ state.liquid_count }}
+
 </div>
 
 </div>
@@ -1599,10 +2652,13 @@ UNIVERSE
 </div>
 
 <div class="stat-value">
+
 {{ state.universe_count }}
+
 </div>
 
 </div>
+
 
 </div>
 
@@ -1610,51 +2666,103 @@ UNIVERSE
 {% if state.error %}
 
 <div class="error">
+
 {{ state.error }}
+
 </div>
 
 {% endif %}
 
 
+<div class="section-title">
+
+Qualified Setups
+
+</div>
+
+
+<div class="section-subtitle">
+
+Score {{ min_setup_score }} or higher.
+These are the only stocks exposed through the trading-bot watchlist API.
+
+</div>
+
+
 {% if state.watchlist %}
+
 
 <div class="cards">
 
+
 {% for item in state.watchlist %}
 
-<div class="card {{ 'call' if item.direction == 'CALL' else 'put' }}">
+
+<div
+class="
+card
+{{ 'call' if item.direction == 'CALL' else 'put' }}
+"
+>
+
 
 <div class="top">
 
+
 <div>
+
 
 <div class="symbol">
+
 {{ item.symbol }}
+
 </div>
 
-<div class="direction {{ 'call-text' if item.direction == 'CALL' else 'put-text' }}">
+
+<div
+class="
+direction
+{{ 'call-text' if item.direction == 'CALL' else 'put-text' }}
+"
+>
+
 {{ item.direction }}
+
 </div>
+
 
 </div>
 
 
 <div>
 
+
 <div class="score">
+
 {{ item.score }}
+
 </div>
+
 
 <div class="score-label">
-SETUP SCORE
-</div>
+
+QUALIFIED
 
 </div>
 
+
 </div>
 
 
-<div class="status {{ 'confirmed' if item.status == 'BREAK_CONFIRMED' else '' }}">
+</div>
+
+
+<div
+class="
+status
+{{ 'confirmed' if item.status == 'BREAK_CONFIRMED' else '' }}
+"
+>
 
 {{ item.status.replace('_',' ') }}
 
@@ -1671,7 +2779,9 @@ CURRENT PRICE
 </div>
 
 <div class="value">
+
 ${{ "%.2f"|format(item.price) }}
+
 </div>
 
 </div>
@@ -1684,7 +2794,9 @@ ENTRY TRIGGER
 </div>
 
 <div class="value entry">
+
 ${{ "%.2f"|format(item.trigger) }}
+
 </div>
 
 </div>
@@ -1744,15 +2856,7 @@ TARGET
 
 <div class="value target">
 
-{% if item.target is not none %}
-
 ${{ "%.2f"|format(item.target) }}
-
-{% else %}
-
-—
-
-{% endif %}
 
 </div>
 
@@ -1766,7 +2870,9 @@ LEVEL TOUCHES
 </div>
 
 <div class="value">
+
 {{ item.touches }}
+
 </div>
 
 </div>
@@ -1785,7 +2891,9 @@ RVOL
 </div>
 
 <div class="indicator-value">
+
 {{ item.rvol }}x
+
 </div>
 
 </div>
@@ -1798,7 +2906,9 @@ EMA5
 </div>
 
 <div class="indicator-value">
+
 {{ "%.2f"|format(item.ema5) }}
+
 </div>
 
 </div>
@@ -1811,7 +2921,9 @@ EMA9
 </div>
 
 <div class="indicator-value">
+
 {{ "%.2f"|format(item.ema9) }}
+
 </div>
 
 </div>
@@ -1824,37 +2936,335 @@ VWAP
 </div>
 
 <div class="indicator-value">
+
 {{ "%.2f"|format(item.vwap) }}
-</div>
 
 </div>
 
-
 </div>
 
 
 </div>
+
+
+</div>
+
 
 {% endfor %}
+
 
 </div>
 
 
 {% else %}
 
+
 <div class="empty">
 
 <strong>
-No qualifying setups yet.
+No qualified setups right now.
 </strong>
 
 <br><br>
 
-The scanner will automatically add
-CALL or PUT candidates when they meet
-the minimum setup score.
+Check the near-miss section below to see
+which stocks are currently closest.
 
 </div>
+
+
+{% endif %}
+
+
+
+<div class="section-title">
+
+Top Near Misses
+
+</div>
+
+
+<div class="section-subtitle">
+
+WATCH ONLY — these stocks are below the
+{{ min_setup_score }} qualification threshold.
+They are NOT included in the bot's trade watchlist.
+
+</div>
+
+
+{% if state.near_misses %}
+
+
+<div class="cards">
+
+
+{% for item in state.near_misses %}
+
+
+<div
+class="
+card
+near
+{{ 'call' if item.direction == 'CALL' else 'put' }}
+"
+>
+
+
+<div class="top">
+
+
+<div>
+
+
+<div class="symbol">
+
+{{ item.symbol }}
+
+</div>
+
+
+<div
+class="
+direction
+{{ 'call-text' if item.direction == 'CALL' else 'put-text' }}
+"
+>
+
+{{ item.direction }}
+
+</div>
+
+
+</div>
+
+
+<div>
+
+
+<div class="score">
+
+{{ item.score }}
+
+</div>
+
+
+<div class="score-label">
+
+WATCH ONLY
+
+</div>
+
+
+</div>
+
+
+</div>
+
+
+<div class="status watch-only">
+
+NOT QUALIFIED
+
+</div>
+
+
+<div class="levels">
+
+
+<div class="level">
+
+<div class="label">
+CURRENT PRICE
+</div>
+
+<div class="value">
+
+${{ "%.2f"|format(item.price) }}
+
+</div>
+
+</div>
+
+
+<div class="level">
+
+<div class="label">
+ENTRY TRIGGER
+</div>
+
+<div class="value entry">
+
+${{ "%.2f"|format(item.trigger) }}
+
+</div>
+
+</div>
+
+
+<div class="level">
+
+<div class="label">
+SUPPORT
+</div>
+
+<div class="value support">
+
+{% if item.support is not none %}
+
+${{ "%.2f"|format(item.support) }}
+
+{% else %}
+
+—
+
+{% endif %}
+
+</div>
+
+</div>
+
+
+<div class="level">
+
+<div class="label">
+RESISTANCE
+</div>
+
+<div class="value resistance">
+
+{% if item.resistance is not none %}
+
+${{ "%.2f"|format(item.resistance) }}
+
+{% else %}
+
+—
+
+{% endif %}
+
+</div>
+
+</div>
+
+
+<div class="level">
+
+<div class="label">
+TARGET
+</div>
+
+<div class="value target">
+
+${{ "%.2f"|format(item.target) }}
+
+</div>
+
+</div>
+
+
+<div class="level">
+
+<div class="label">
+NEEDED SCORE
+</div>
+
+<div class="value">
+
+{{ min_setup_score }}
+
+</div>
+
+</div>
+
+
+</div>
+
+
+<div class="indicators">
+
+
+<div class="indicator">
+
+<div class="indicator-label">
+RVOL
+</div>
+
+<div class="indicator-value">
+
+{{ item.rvol }}x
+
+</div>
+
+</div>
+
+
+<div class="indicator">
+
+<div class="indicator-label">
+EMA5
+</div>
+
+<div class="indicator-value">
+
+{{ "%.2f"|format(item.ema5) }}
+
+</div>
+
+</div>
+
+
+<div class="indicator">
+
+<div class="indicator-label">
+EMA9
+</div>
+
+<div class="indicator-value">
+
+{{ "%.2f"|format(item.ema9) }}
+
+</div>
+
+</div>
+
+
+<div class="indicator">
+
+<div class="indicator-label">
+VWAP
+</div>
+
+<div class="indicator-value">
+
+{{ "%.2f"|format(item.vwap) }}
+
+</div>
+
+</div>
+
+
+</div>
+
+
+</div>
+
+
+{% endfor %}
+
+
+</div>
+
+
+{% else %}
+
+
+<div class="empty">
+
+No near-miss candidates available yet.
+
+</div>
+
 
 {% endif %}
 
@@ -1875,7 +3285,14 @@ Waiting for first scan...
 
 <br>
 
-Scanner runs every {{ scan_seconds }} seconds.
+Qualification threshold:
+{{ min_setup_score }}
+
+<br>
+
+Scanner runs every
+{{ scan_seconds }}
+seconds.
 
 Website refreshes every 20 seconds.
 
@@ -1883,6 +3300,7 @@ Website refreshes every 20 seconds.
 
 
 </div>
+
 
 </body>
 
@@ -1896,7 +3314,9 @@ Website refreshes every 20 seconds.
 
 @app.get("/")
 def home():
+
     with lock:
+
         snapshot = dict(
             STATE
         )
@@ -1904,18 +3324,73 @@ def home():
     return render_template_string(
         HTML,
         state=snapshot,
-        scan_seconds=SCAN_SECONDS
+        scan_seconds=SCAN_SECONDS,
+        min_setup_score=MIN_SETUP_SCORE
     )
 
 
 # ============================================================
-# WATCHLIST API
-# main.py READS THIS
+# BOT WATCHLIST API
+#
+# IMPORTANT:
+# NEAR MISSES ARE DELIBERATELY NOT RETURNED HERE.
 # ============================================================
 
 @app.get("/api/watchlist")
 def api_watchlist():
+
     with lock:
+
+        return jsonify({
+
+            "status":
+                STATE[
+                    "status"
+                ],
+
+            "last_scan":
+                STATE[
+                    "last_scan"
+                ],
+
+            "universe_count":
+                STATE[
+                    "universe_count"
+                ],
+
+            "liquid_count":
+                STATE[
+                    "liquid_count"
+                ],
+
+            "watchlist_count":
+                STATE[
+                    "watchlist_count"
+                ],
+
+            # QUALIFIED ONLY
+            "watchlist":
+                STATE[
+                    "watchlist"
+                ],
+
+            "error":
+                STATE[
+                    "error"
+                ],
+        })
+
+
+# ============================================================
+# FULL DISPLAY API
+# OPTIONAL — WEBSITE/DEBUGGING
+# ============================================================
+
+@app.get("/api/display")
+def api_display():
+
+    with lock:
+
         return jsonify(
             dict(
                 STATE
@@ -1929,14 +3404,39 @@ def api_watchlist():
 
 @app.get("/health")
 def health():
+
     with lock:
+
         return jsonify({
-            "ok": True,
-            "status": STATE["status"],
-            "last_scan": STATE["last_scan"],
-            "watchlist_count": STATE["watchlist_count"],
-            "timeframe": TIMEFRAME,
-            "min_setup_score": MIN_SETUP_SCORE,
+
+            "ok":
+                True,
+
+            "status":
+                STATE[
+                    "status"
+                ],
+
+            "last_scan":
+                STATE[
+                    "last_scan"
+                ],
+
+            "qualified":
+                STATE[
+                    "watchlist_count"
+                ],
+
+            "near_misses":
+                STATE[
+                    "near_miss_count"
+                ],
+
+            "timeframe":
+                TIMEFRAME,
+
+            "min_setup_score":
+                MIN_SETUP_SCORE,
         })
 
 
