@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import json
 import threading
 import logging
 
@@ -90,7 +91,7 @@ LOOP_SECONDS = int(
 MIN_SETUP_SCORE = float(
     os.getenv(
         "BOT_MIN_SETUP_SCORE",
-        "82"
+        "70"
     )
 )
 
@@ -122,12 +123,17 @@ OPTION_QTY = int(
     )
 )
 
+TIMEFRAME = "4Min"
+
+EMA_FAST = 5
+EMA_SLOW = 9
+EMA_TREND = 30
+
 
 # ============================================================
 # MARKET HOURS
 # ============================================================
 
-# NO NEW ENTRIES BEFORE 9:30 AM ET
 RTH_START = dt_time.fromisoformat(
     os.getenv(
         "RTH_START",
@@ -135,7 +141,6 @@ RTH_START = dt_time.fromisoformat(
     )
 )
 
-# NO NEW ENTRIES AFTER 2:45 PM ET
 LAST_ENTRY = dt_time.fromisoformat(
     os.getenv(
         "LAST_ENTRY",
@@ -143,24 +148,12 @@ LAST_ENTRY = dt_time.fromisoformat(
     )
 )
 
-# FORCE MANAGED POSITIONS CLOSED AT 3:15 PM ET
 FORCE_EXIT = dt_time.fromisoformat(
     os.getenv(
         "FORCE_EXIT",
         "15:15"
     )
 )
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
-
-TIMEFRAME = "4Min"
-
-EMA_FAST = 5
-EMA_SLOW = 9
-EMA_TREND = 30
 
 
 # ============================================================
@@ -172,7 +165,11 @@ lock = threading.Lock()
 STATE = {
     "status": "STARTING",
     "last_cycle": None,
+    "scanner_last_scan": None,
+    "scanner_candidates": 0,
+    "watching_count": 0,
     "watching": [],
+    "removed": [],
     "last_ai_decision": None,
     "last_order": None,
     "errors": [],
@@ -181,6 +178,31 @@ STATE = {
     "last_entry": "14:45 ET",
     "force_exit": "15:15 ET",
 }
+
+
+# ============================================================
+# SCANNER MEMORY
+# ============================================================
+
+#
+# This is the important part.
+#
+# The bot remembers every stock returned by the scanner here.
+#
+# Example:
+#
+# WATCH_MEMORY["AAPL"] = {
+#     "symbol": "AAPL",
+#     "direction": "CALL",
+#     "score": 86.2,
+#     "status": "WAITING_CONFIRMATION",
+#     ...
+# }
+#
+
+WATCH_MEMORY = {}
+
+LAST_SCANNER_ID = None
 
 seen_ai_bars = set()
 
@@ -202,13 +224,14 @@ def log_error(error):
     with lock:
 
         STATE["errors"] = (
-            STATE["errors"] +
+            STATE["errors"]
+            +
             [msg]
         )[-20:]
 
 
 # ============================================================
-# API REQUEST
+# ALPACA API REQUEST
 # ============================================================
 
 def req(
@@ -244,10 +267,10 @@ def req(
 
 
 # ============================================================
-# SCANNER WATCHLIST
+# SCANNER RESPONSE
 # ============================================================
 
-def scanner_watchlist():
+def load_scanner():
 
     response = requests.get(
         SCANNER_URL,
@@ -266,11 +289,70 @@ def scanner_watchlist():
         []
     )
 
-    output = []
+    scanner_id = (
+        payload.get("last_scan")
+        or
+        payload.get("scanned_at")
+        or
+        payload.get("scan_time")
+        or
+        payload.get("timestamp")
+    )
+
+    #
+    # If scanner does not provide a scan timestamp,
+    # create a stable signature from its current results.
+    #
+
+    if not scanner_id:
+
+        signature = []
+
+        for item in items:
+
+            signature.append(
+                (
+                    str(
+                        item.get(
+                            "symbol",
+                            ""
+                        )
+                    ).upper(),
+                    str(
+                        item.get(
+                            "direction",
+                            ""
+                        )
+                    ).upper(),
+                    item.get("score"),
+                    item.get("trigger"),
+                )
+            )
+
+        scanner_id = json.dumps(
+            sorted(signature),
+            default=str
+        )
+
+    qualified = []
 
     for item in items:
 
         try:
+
+            symbol = str(
+                item.get(
+                    "symbol",
+                    ""
+                )
+            ).upper().strip()
+
+            direction = str(
+                item.get(
+                    "direction",
+                    ""
+                )
+            ).upper().strip()
 
             score = float(
                 item.get(
@@ -279,30 +361,276 @@ def scanner_watchlist():
                 )
             )
 
-            direction = str(
-                item.get(
-                    "direction",
-                    ""
-                )
-            ).upper()
+            if not symbol:
+                continue
 
-            if (
-                score >= MIN_SETUP_SCORE
-                and
-                direction in (
-                    "CALL",
-                    "PUT"
-                )
+            if direction not in (
+                "CALL",
+                "PUT"
             ):
+                continue
 
-                output.append(
-                    item
-                )
+            if score < MIN_SETUP_SCORE:
+                continue
 
-        except Exception:
-            pass
+            candidate = dict(item)
 
-    return output
+            candidate["symbol"] = symbol
+            candidate["direction"] = direction
+            candidate["score"] = score
+
+            qualified.append(
+                candidate
+            )
+
+        except Exception as error:
+
+            logging.warning(
+                "Bad scanner item: %s",
+                error
+            )
+
+    return {
+        "scanner_id": str(scanner_id),
+        "last_scan": (
+            payload.get("last_scan")
+            or
+            payload.get("scanned_at")
+            or
+            payload.get("scan_time")
+        ),
+        "qualified": qualified,
+    }
+
+
+# ============================================================
+# SYNCHRONIZE SCANNER MEMORY
+# ============================================================
+
+def sync_scanner_memory():
+
+    global LAST_SCANNER_ID
+
+    result = load_scanner()
+
+    scanner_id = result[
+        "scanner_id"
+    ]
+
+    candidates = result[
+        "qualified"
+    ]
+
+    scanner_last_scan = result.get(
+        "last_scan"
+    )
+
+    #
+    # SAME SCAN:
+    #
+    # Do not destroy/rebuild memory every 20 seconds.
+    # Continue watching the previously remembered setups.
+    #
+
+    if scanner_id == LAST_SCANNER_ID:
+
+        return list(
+            WATCH_MEMORY.values()
+        )
+
+    #
+    # NEW SCAN:
+    #
+
+    LAST_SCANNER_ID = scanner_id
+
+    now = datetime.now(
+        NY
+    ).isoformat()
+
+    current_keys = set()
+
+    removed = []
+
+    for item in candidates:
+
+        symbol = item[
+            "symbol"
+        ]
+
+        direction = item[
+            "direction"
+        ]
+
+        key = (
+            symbol,
+            direction
+        )
+
+        current_keys.add(
+            key
+        )
+
+        old = WATCH_MEMORY.get(
+            symbol
+        )
+
+        #
+        # Brand-new scanner setup
+        #
+
+        if (
+            old is None
+            or
+            old.get(
+                "direction"
+            )
+            !=
+            direction
+        ):
+
+            WATCH_MEMORY[
+                symbol
+            ] = {
+                **item,
+
+                "status": "WATCHING",
+
+                "first_seen": now,
+
+                "last_seen": now,
+
+                "scanner_scan": scanner_last_scan,
+
+                "confirmation_bar": None,
+
+                "ai_checked": False,
+
+                "entered": False,
+            }
+
+            logging.info(
+                "SCANNER ADD | %s %s | score %.2f",
+                symbol,
+                direction,
+                float(
+                    item.get(
+                        "score",
+                        0
+                    )
+                ),
+            )
+
+        #
+        # Existing setup still qualifies
+        #
+
+        else:
+
+            previous_status = old.get(
+                "status",
+                "WATCHING"
+            )
+
+            old.update(
+                item
+            )
+
+            old[
+                "last_seen"
+            ] = now
+
+            old[
+                "scanner_scan"
+            ] = scanner_last_scan
+
+            #
+            # Don't reset ENTERED setups.
+            #
+
+            if previous_status != "ENTERED":
+
+                old[
+                    "status"
+                ] = previous_status
+
+    #
+    # REMOVE setups that disappeared from the NEW scanner scan.
+    #
+
+    for symbol in list(
+        WATCH_MEMORY.keys()
+    ):
+
+        item = WATCH_MEMORY[
+            symbol
+        ]
+
+        key = (
+            symbol,
+            item.get(
+                "direction"
+            )
+        )
+
+        if key not in current_keys:
+
+            if item.get(
+                "status"
+            ) == "ENTERED":
+
+                #
+                # Position management remains active even
+                # if the scanner removes the stock.
+                #
+
+                continue
+
+            removed_item = dict(
+                item
+            )
+
+            removed_item[
+                "status"
+            ] = "REMOVED"
+
+            removed_item[
+                "removed_at"
+            ] = now
+
+            removed.append(
+                removed_item
+            )
+
+            WATCH_MEMORY.pop(
+                symbol,
+                None
+            )
+
+            logging.info(
+                "SCANNER REMOVE | %s | no longer qualified",
+                symbol
+            )
+
+    with lock:
+
+        STATE[
+            "scanner_last_scan"
+        ] = scanner_last_scan
+
+        STATE[
+            "scanner_candidates"
+        ] = len(
+            candidates
+        )
+
+        STATE[
+            "removed"
+        ] = removed[-20:]
+
+    return list(
+        WATCH_MEMORY.values()
+    )
 
 
 # ============================================================
@@ -319,7 +647,8 @@ def get_bars(
     )
 
     start = (
-        now -
+        now
+        -
         timedelta(
             hours=hours
         )
@@ -368,7 +697,9 @@ def get_bars(
         }
     )
 
-    df["timestamp"] = pd.to_datetime(
+    df[
+        "timestamp"
+    ] = pd.to_datetime(
         df["timestamp"],
         utc=True,
     )
@@ -392,20 +723,26 @@ def get_bars(
         "volume",
     ]:
 
-        df[column] = pd.to_numeric(
+        df[
+            column
+        ] = pd.to_numeric(
             df[column],
             errors="coerce",
         )
 
     df = df.dropna()
 
-    # ONLY USE FULLY CLOSED 4-MINUTE BARS
+    #
+    # Only use completed 4-minute candles.
+    #
+
     now_et = datetime.now(
         NY
     )
 
     df = df[
-        df.index +
+        df.index
+        +
         pd.Timedelta(
             minutes=4
         )
@@ -424,7 +761,9 @@ def enrich(df):
 
     data = df.copy()
 
-    data["ema5"] = (
+    data[
+        "ema5"
+    ] = (
         data["close"]
         .ewm(
             span=EMA_FAST,
@@ -433,7 +772,9 @@ def enrich(df):
         .mean()
     )
 
-    data["ema9"] = (
+    data[
+        "ema9"
+    ] = (
         data["close"]
         .ewm(
             span=EMA_SLOW,
@@ -442,7 +783,9 @@ def enrich(df):
         .mean()
     )
 
-    data["ema30"] = (
+    data[
+        "ema30"
+    ] = (
         data["close"]
         .ewm(
             span=EMA_TREND,
@@ -457,8 +800,10 @@ def enrich(df):
     )
 
     typical_price = (
-        data["high"] +
-        data["low"] +
+        data["high"]
+        +
+        data["low"]
+        +
         data["close"]
     ) / 3
 
@@ -474,9 +819,12 @@ def enrich(df):
         )
     )
 
-    data["vwap"] = (
+    data[
+        "vwap"
+    ] = (
         (
-            typical_price *
+            typical_price
+            *
             data["volume"]
         )
         .groupby(
@@ -487,7 +835,9 @@ def enrich(df):
         cumulative_volume
     )
 
-    data["vol20"] = (
+    data[
+        "vol20"
+    ] = (
         data["volume"]
         .rolling(
             20,
@@ -500,7 +850,7 @@ def enrich(df):
 
 
 # ============================================================
-# HARD CONFIRMATION
+# HARD ENTRY CONFIRMATION
 # ============================================================
 
 def hard_confirmation(
@@ -508,7 +858,7 @@ def hard_confirmation(
     df
 ):
 
-    if len(df) < 4:
+    if len(df) < 30:
         return None
 
     data = enrich(
@@ -524,74 +874,108 @@ def hard_confirmation(
     ]
 
     direction = str(
-        item["direction"]
+        item.get(
+            "direction",
+            ""
+        )
     ).upper()
 
-    trigger = float(
-        item["trigger"]
+    trigger_raw = item.get(
+        "trigger"
     )
+
+    if trigger_raw is None:
+        return None
+
+    try:
+
+        trigger = float(
+            trigger_raw
+        )
+
+    except Exception:
+
+        return None
 
     price = float(
-        last["close"]
+        last[
+            "close"
+        ]
     )
 
-    bull = (
-        last["ema5"] >
+    bullish_candle = (
+        float(
+            last["close"]
+        )
+        >
+        float(
+            last["open"]
+        )
+    )
+
+    bearish_candle = (
+        float(
+            last["close"]
+        )
+        <
+        float(
+            last["open"]
+        )
+    )
+
+    call_structure = (
+        last["ema5"]
+        >
         last["ema9"]
         and
-        price >
+        last["ema9"]
+        >
+        last["ema30"]
+        and
+        price
+        >
         last["vwap"]
     )
 
-    bear = (
-        last["ema5"] <
+    put_structure = (
+        last["ema5"]
+        <
         last["ema9"]
         and
-        price <
+        last["ema9"]
+        <
+        last["ema30"]
+        and
+        price
+        <
         last["vwap"]
     )
 
     if direction == "CALL":
 
-        broke = (
-            price > trigger
+        confirmed = (
+            price
+            >
+            trigger
             and
-            float(
-                previous["close"]
-            ) <= trigger
+            bullish_candle
             and
-            bull
-        )
-
-        already_beyond = (
-            price > trigger
-            and
-            bull
+            call_structure
         )
 
     else:
 
-        broke = (
-            price < trigger
+        confirmed = (
+            price
+            <
+            trigger
             and
-            float(
-                previous["close"]
-            ) >= trigger
+            bearish_candle
             and
-            bear
+            put_structure
         )
 
-        already_beyond = (
-            price < trigger
-            and
-            bear
-        )
-
-    if not (
-        broke
-        or
-        already_beyond
-    ):
+    if not confirmed:
         return None
 
     candles = []
@@ -633,10 +1017,14 @@ def hard_confirmation(
 
     if (
         pd.notna(
-            last["vol20"]
+            last[
+                "vol20"
+            ]
         )
         and
-        last["vol20"]
+        last[
+            "vol20"
+        ]
     ):
 
         volume_ratio = (
@@ -650,67 +1038,94 @@ def hard_confirmation(
         volume_ratio = 1.0
 
     return {
-        "symbol": item["symbol"],
+        "symbol": item[
+            "symbol"
+        ],
+
         "direction": direction,
+
         "scanner_score": item.get(
             "score"
         ),
+
         "scanner_status": item.get(
             "status"
         ),
+
         "trigger": trigger,
+
         "support": item.get(
             "support"
         ),
+
         "resistance": item.get(
             "resistance"
         ),
+
         "scanner_target": item.get(
             "target"
         ),
+
         "price": round(
             price,
             4
         ),
+
         "ema5": round(
             float(
                 last["ema5"]
             ),
             4
         ),
+
         "ema9": round(
             float(
                 last["ema9"]
             ),
             4
         ),
+
         "ema30": round(
             float(
                 last["ema30"]
             ),
             4
         ),
+
         "vwap": round(
             float(
                 last["vwap"]
             ),
             4
         ),
+
         "volume_ratio": round(
             float(
                 volume_ratio
             ),
             2
         ),
+
         "bar_time": (
             data.index[-1]
             .isoformat()
         ),
+
+        "previous_close": round(
+            float(
+                previous[
+                    "close"
+                ]
+            ),
+            4
+        ),
+
         "recent_candles": candles,
+
         "rule_note": (
-            "Latest bar is closed. "
-            "ENTER only if breakout remains valid "
-            "and reward to next level is adequate."
+            "Scanner qualification alone is NOT an entry. "
+            "Latest completed 4-minute candle must confirm "
+            "direction, trigger, EMA structure and VWAP."
         ),
     }
 
@@ -810,7 +1225,9 @@ def option_contract(
     if not contracts:
         return None
 
-    def strike(contract):
+    def strike(
+        contract
+    ):
 
         try:
 
@@ -870,8 +1287,7 @@ def submit_option(
     if not contract:
 
         raise RuntimeError(
-            f"No same-day {direction} "
-            f"option contract for {symbol}"
+            f"No same-day {direction} option contract for {symbol}"
         )
 
     option_symbol = (
@@ -911,7 +1327,9 @@ def submit_option(
         option_symbol
     ] = {
         "underlying": symbol,
+
         "direction": direction,
+
         "trigger": (
             decision.get(
                 "entry"
@@ -919,17 +1337,43 @@ def submit_option(
             or
             price
         ),
+
         "stop": decision.get(
             "stop"
         ),
+
         "tp1": decision.get(
             "tp1"
         ),
+
         "tp2": decision.get(
             "tp2"
         ),
+
         "tp1_done": False,
     }
+
+    if symbol in WATCH_MEMORY:
+
+        WATCH_MEMORY[
+            symbol
+        ][
+            "status"
+        ] = "ENTERED"
+
+        WATCH_MEMORY[
+            symbol
+        ][
+            "entered_at"
+        ] = datetime.now(
+            NY
+        ).isoformat()
+
+        WATCH_MEMORY[
+            symbol
+        ][
+            "option_symbol"
+        ] = option_symbol
 
     logging.info(
         "ORDER SUBMITTED | %s %s | %s",
@@ -989,8 +1433,9 @@ def latest_stock_price(
         return None
 
     return float(
-        df["close"]
-        .iloc[-1]
+        df[
+            "close"
+        ].iloc[-1]
     )
 
 
@@ -1004,6 +1449,8 @@ def manage_positions():
         NY
     )
 
+    current_positions = positions()
+
     for option_symbol, info in list(
         managed.items()
     ):
@@ -1014,7 +1461,7 @@ def manage_positions():
                 (
                     position
                     for position
-                    in positions()
+                    in current_positions
                     if position.get(
                         "symbol"
                     )
@@ -1052,7 +1499,9 @@ def manage_positions():
                 continue
 
             price = latest_stock_price(
-                info["underlying"]
+                info[
+                    "underlying"
+                ]
             )
 
             if price is None:
@@ -1109,28 +1558,6 @@ def manage_positions():
                 )
             )
 
-            tp2_hit = (
-                tp2 is not None
-                and
-                (
-                    (
-                        direction == "CALL"
-                        and
-                        price >= float(
-                            tp2
-                        )
-                    )
-                    or
-                    (
-                        direction == "PUT"
-                        and
-                        price <= float(
-                            tp2
-                        )
-                    )
-                )
-            )
-
             tp1_hit = (
                 tp1 is not None
                 and
@@ -1148,6 +1575,28 @@ def manage_positions():
                         and
                         price <= float(
                             tp1
+                        )
+                    )
+                )
+            )
+
+            tp2_hit = (
+                tp2 is not None
+                and
+                (
+                    (
+                        direction == "CALL"
+                        and
+                        price >= float(
+                            tp2
+                        )
+                    )
+                    or
+                    (
+                        direction == "PUT"
+                        and
+                        price <= float(
+                            tp2
                         )
                     )
                 )
@@ -1236,6 +1685,30 @@ def manage_positions():
 
 
 # ============================================================
+# CLEAN OLD DAILY COUNTS
+# ============================================================
+
+def clean_daily_counts():
+
+    today = datetime.now(
+        NY
+    ).date().isoformat()
+
+    for key in list(
+        daily_trade_counts.keys()
+    ):
+
+        symbol, date = key
+
+        if date != today:
+
+            daily_trade_counts.pop(
+                key,
+                None
+            )
+
+
+# ============================================================
 # MAIN BOT CYCLE
 # ============================================================
 
@@ -1245,34 +1718,64 @@ def cycle():
         NY
     )
 
-    # ALWAYS MANAGE EXISTING POSITIONS
+    clean_daily_counts()
+
+    #
+    # Always manage existing positions.
+    #
+
     manage_positions()
 
-    # ========================================================
-    # NEW:
-    # DO NOT EVEN EVALUATE NEW ENTRIES BEFORE 9:30 AM ET
-    # ========================================================
+    #
+    # Always synchronize scanner memory.
+    #
+    # This lets the bot remember the scan even though
+    # the bot itself loops every 20 seconds.
+    #
+
+    watch = sync_scanner_memory()
+
+    with lock:
+
+        STATE[
+            "watching_count"
+        ] = len(
+            watch
+        )
+
+        STATE[
+            "watching"
+        ] = list(
+            WATCH_MEMORY.values()
+        )
+
+    #
+    # Premarket:
+    # remember scanner setups,
+    # but do NOT enter.
+    #
 
     if now.time() < RTH_START:
 
         with lock:
 
             STATE.update(
-                status="PREMARKET_WAIT",
+                status="PREMARKET_WATCHING",
                 last_cycle=now.isoformat(),
-                watching=[],
             )
 
         logging.info(
-            "PREMARKET WAIT | "
-            "No new entries before 09:30 ET"
+            "PREMARKET | Remembering %s scanner candidates",
+            len(
+                watch
+            )
         )
 
         return
 
-    # ========================================================
-    # NO NEW ENTRIES AFTER 2:45 PM ET
-    # ========================================================
+    #
+    # No new entries after cutoff.
+    #
 
     if now.time() >= LAST_ENTRY:
 
@@ -1285,39 +1788,36 @@ def cycle():
 
         return
 
-    # ========================================================
-    # LOAD SCANNER CANDIDATES
-    # ========================================================
-
-    watch = scanner_watchlist()
-
     new_trades = 0
 
     logging.info(
-        "WATCHLIST | %s candidates",
+        "BOT MEMORY | %s active candidates",
         len(
             watch
         )
     )
 
-    # ========================================================
-    # PROCESS CANDIDATES
-    # ========================================================
+    #
+    # Rank highest scanner score first.
+    #
+
+    watch = sorted(
+        watch,
+        key=lambda x: float(
+            x.get(
+                "score",
+                0
+            )
+        ),
+        reverse=True
+    )
 
     for item in watch:
 
         if (
-            new_trades >=
-            MAX_NEW_TRADES_PER_CYCLE
-        ):
-            break
-
-        if (
-            len(
-                positions()
-            )
+            new_trades
             >=
-            MAX_OPEN_POSITIONS
+            MAX_NEW_TRADES_PER_CYCLE
         ):
             break
 
@@ -1328,8 +1828,42 @@ def cycle():
             )
         ).upper()
 
+        direction = str(
+            item.get(
+                "direction",
+                ""
+            )
+        ).upper()
+
         if not symbol:
             continue
+
+        memory = WATCH_MEMORY.get(
+            symbol
+        )
+
+        if not memory:
+            continue
+
+        if memory.get(
+            "status"
+        ) == "ENTERED":
+            continue
+
+        #
+        # Position limit.
+        #
+
+        current_positions = positions()
+
+        if (
+            len(
+                current_positions
+            )
+            >=
+            MAX_OPEN_POSITIONS
+        ):
+            break
 
         keyday = (
             symbol,
@@ -1344,16 +1878,44 @@ def cycle():
             >=
             MAX_TRADES_PER_SYMBOL_DAY
         ):
+
+            memory[
+                "status"
+            ] = "DAILY_LIMIT"
+
             continue
 
         if underlying_open(
             symbol
         ):
+
+            memory[
+                "status"
+            ] = "ENTERED"
+
             continue
 
-        df = get_bars(
-            symbol
-        )
+        #
+        # Waiting for completed 4-minute confirmation.
+        #
+
+        memory[
+            "status"
+        ] = "WAITING_CONFIRMATION"
+
+        try:
+
+            df = get_bars(
+                symbol
+            )
+
+        except Exception as error:
+
+            log_error(
+                f"bars {symbol}: {error}"
+            )
+
+            continue
 
         setup = hard_confirmation(
             item,
@@ -1361,28 +1923,76 @@ def cycle():
         )
 
         if not setup:
+
             continue
+
+        memory[
+            "status"
+        ] = "CONFIRMED"
+
+        memory[
+            "confirmation_bar"
+        ] = setup[
+            "bar_time"
+        ]
+
+        #
+        # Prevent AI from evaluating the same closed candle twice.
+        #
 
         ai_key = (
             symbol,
-            setup["direction"],
-            setup["bar_time"],
+            direction,
+            setup[
+                "bar_time"
+            ],
         )
 
         if ai_key in seen_ai_bars:
+
             continue
 
         seen_ai_bars.add(
             ai_key
         )
 
-        # ====================================================
-        # AI CONFIRMATION
-        # ====================================================
+        memory[
+            "status"
+        ] = "AI_REVIEW"
 
-        decision = ask_ai(
-            setup
-        )
+        #
+        # AI confirmation.
+        #
+
+        try:
+
+            decision = ask_ai(
+                setup
+            )
+
+        except Exception as error:
+
+            memory[
+                "status"
+            ] = "AI_ERROR"
+
+            log_error(
+                f"AI {symbol}: {error}"
+            )
+
+            continue
+
+        memory[
+            "ai_checked"
+        ] = True
+
+        memory[
+            "ai_decision"
+        ] = decision
+
+        memory[
+            "ai_checked_at"
+        ] = now.isoformat()
 
         with lock:
 
@@ -1397,12 +2007,16 @@ def cycle():
         logging.info(
             "AI %s %s -> %s %.2f | %s",
             symbol,
-            setup["direction"],
+            direction,
             decision.get(
                 "decision"
             ),
-            decision.get(
-                "confidence",
+            float(
+                decision.get(
+                    "confidence",
+                    0
+                )
+                or
                 0
             ),
             decision.get(
@@ -1410,19 +2024,34 @@ def cycle():
             ),
         )
 
-        # AI MUST SAY ENTER
+        #
+        # AI must specifically return ENTER.
+        #
+
         if (
-            decision.get(
-                "decision"
-            )
+            str(
+                decision.get(
+                    "decision",
+                    ""
+                )
+            ).upper()
             !=
             "ENTER"
         ):
+
+            memory[
+                "status"
+            ] = "WAITING_CONFIRMATION"
+
             continue
 
-        # ====================================================
-        # PAPER AUTO TRADE SWITCH
-        # ====================================================
+        memory[
+            "status"
+        ] = "ENTRY_APPROVED"
+
+        #
+        # Safety switch.
+        #
 
         if not AUTO_TRADE:
 
@@ -1430,27 +2059,55 @@ def cycle():
                 "ENTRY APPROVED BUT SKIPPED | "
                 "%s %s | AUTO_TRADE=false",
                 symbol,
-                setup[
-                    "direction"
-                ],
+                direction,
+            )
+
+            memory[
+                "status"
+            ] = "APPROVED_NO_AUTOTRADE"
+
+            continue
+
+        #
+        # Final safety check:
+        # stock must STILL be in scanner memory.
+        #
+
+        if symbol not in WATCH_MEMORY:
+
+            logging.info(
+                "ENTRY CANCELLED | %s removed from scanner",
+                symbol
             )
 
             continue
 
-        # ====================================================
-        # PLACE PAPER OPTION ORDER
-        # ====================================================
+        #
+        # Place paper option order.
+        #
 
-        order = submit_option(
-            symbol,
-            setup[
-                "direction"
-            ],
-            setup[
-                "price"
-            ],
-            decision,
-        )
+        try:
+
+            order = submit_option(
+                symbol,
+                direction,
+                setup[
+                    "price"
+                ],
+                decision,
+            )
+
+        except Exception as error:
+
+            memory[
+                "status"
+            ] = "ORDER_ERROR"
+
+            log_error(
+                f"order {symbol}: {error}"
+            )
+
+            continue
 
         daily_trade_counts[
             keyday
@@ -1465,6 +2122,10 @@ def cycle():
 
         new_trades += 1
 
+        memory[
+            "status"
+        ] = "ENTERED"
+
         with lock:
 
             STATE[
@@ -1476,7 +2137,12 @@ def cycle():
         STATE.update(
             status="RUNNING",
             last_cycle=now.isoformat(),
-            watching=watch,
+            watching_count=len(
+                WATCH_MEMORY
+            ),
+            watching=list(
+                WATCH_MEMORY.values()
+            ),
         )
 
 
@@ -1517,6 +2183,34 @@ def home():
         )
 
 
+@app.get("/watching")
+def watching():
+
+    return jsonify({
+        "count": len(
+            WATCH_MEMORY
+        ),
+        "scanner_last_scan": STATE.get(
+            "scanner_last_scan"
+        ),
+        "watching": list(
+            WATCH_MEMORY.values()
+        ),
+    })
+
+
+@app.get("/memory")
+def memory():
+
+    return jsonify({
+        "scanner_id": LAST_SCANNER_ID,
+        "count": len(
+            WATCH_MEMORY
+        ),
+        "symbols": WATCH_MEMORY,
+    })
+
+
 @app.get("/health")
 def health():
 
@@ -1529,6 +2223,12 @@ def health():
         "last_cycle": STATE[
             "last_cycle"
         ],
+        "scanner_last_scan": STATE.get(
+            "scanner_last_scan"
+        ),
+        "watching_count": len(
+            WATCH_MEMORY
+        ),
         "market_entry_start": "09:30 ET",
         "last_entry": "14:45 ET",
         "force_exit": "15:15 ET",
@@ -1540,12 +2240,17 @@ def health():
 # START
 # ============================================================
 
-if __name__ == "__main__":
+def start_bot():
 
     threading.Thread(
         target=loop,
         daemon=True,
     ).start()
+
+
+if __name__ == "__main__":
+
+    start_bot()
 
     app.run(
         host="0.0.0.0",
@@ -1559,7 +2264,4 @@ if __name__ == "__main__":
 
 else:
 
-    threading.Thread(
-        target=loop,
-        daemon=True,
-    ).start()
+    start_bot()
