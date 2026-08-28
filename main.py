@@ -31,17 +31,26 @@ UTC = ZoneInfo("UTC")
 
 
 # ============================================================
-# ALPACA PAPER TRADING
+# ALPACA
 # ============================================================
 
 TRADING_URL = "https://paper-api.alpaca.markets"
 DATA_URL = "https://data.alpaca.markets"
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
+ALPACA_API_KEY = os.getenv(
+    "ALPACA_API_KEY",
+    "",
+).strip()
 
-DATA_FEED = os.getenv("DATA_FEED", "iex").strip().lower()
-OPTION_FEED = os.getenv("OPTION_FEED", "opra").strip().lower()
+ALPACA_SECRET_KEY = os.getenv(
+    "ALPACA_SECRET_KEY",
+    "",
+).strip()
+
+DATA_FEED = os.getenv(
+    "DATA_FEED",
+    "iex",
+).strip().lower()
 
 SCANNER_URL = os.getenv(
     "SCANNER_URL",
@@ -61,36 +70,57 @@ HEADERS = {
 
 
 # ============================================================
-# BOT SETTINGS
+# SETTINGS
 # ============================================================
 
 AUTO_TRADE = (
-    os.getenv("AUTO_TRADE", "false").strip().lower()
+    os.getenv(
+        "AUTO_TRADE",
+        "false",
+    ).strip().lower()
     == "true"
 )
 
 LOOP_SECONDS = int(
-    os.getenv("LOOP_SECONDS", "20")
+    os.getenv(
+        "LOOP_SECONDS",
+        "20",
+    )
 )
 
 MIN_SETUP_SCORE = float(
-    os.getenv("BOT_MIN_SETUP_SCORE", "70")
+    os.getenv(
+        "BOT_MIN_SETUP_SCORE",
+        "70",
+    )
 )
 
 MAX_OPEN_POSITIONS = int(
-    os.getenv("MAX_OPEN_POSITIONS", "3")
+    os.getenv(
+        "MAX_OPEN_POSITIONS",
+        "3",
+    )
 )
 
 MAX_NEW_TRADES_PER_CYCLE = int(
-    os.getenv("MAX_NEW_TRADES_PER_CYCLE", "1")
+    os.getenv(
+        "MAX_NEW_TRADES_PER_CYCLE",
+        "1",
+    )
 )
 
 MAX_TRADES_PER_SYMBOL_DAY = int(
-    os.getenv("MAX_TRADES_PER_SYMBOL_DAY", "2")
+    os.getenv(
+        "MAX_TRADES_PER_SYMBOL_DAY",
+        "2",
+    )
 )
 
 OPTION_QTY = int(
-    os.getenv("OPTION_QTY", "1")
+    os.getenv(
+        "OPTION_QTY",
+        "1",
+    )
 )
 
 TIMEFRAME = "4Min"
@@ -105,15 +135,24 @@ EMA_TREND = 30
 # ============================================================
 
 RTH_START = dt_time.fromisoformat(
-    os.getenv("RTH_START", "09:30")
+    os.getenv(
+        "RTH_START",
+        "09:30",
+    )
 )
 
 LAST_ENTRY = dt_time.fromisoformat(
-    os.getenv("LAST_ENTRY", "14:45")
+    os.getenv(
+        "LAST_ENTRY",
+        "14:45",
+    )
 )
 
 FORCE_EXIT = dt_time.fromisoformat(
-    os.getenv("FORCE_EXIT", "15:15")
+    os.getenv(
+        "FORCE_EXIT",
+        "15:15",
+    )
 )
 
 
@@ -130,13 +169,14 @@ STATE = {
     "scanner_candidates": 0,
     "watching_count": 0,
     "watching": [],
-    "removed": [],
     "last_ai_decision": None,
     "last_order": None,
     "last_discord_alert": None,
     "errors": [],
     "auto_trade": AUTO_TRADE,
-    "discord_enabled": bool(DISCORD_WEBHOOK_URL),
+    "discord_enabled": bool(
+        DISCORD_WEBHOOK_URL
+    ),
     "discord_mode": "BREAKOUTS_ONLY",
     "market_entry_start": "09:30 ET",
     "last_entry": "14:45 ET",
@@ -155,12 +195,17 @@ managed = {}
 
 discord_seen = set()
 
+MEMORY_DATE = None
+
 
 # ============================================================
 # DISCORD
 # ============================================================
 
-def discord_notify(message, dedupe_key=None):
+def discord_notify(
+    message,
+    dedupe_key=None,
+):
 
     if not DISCORD_WEBHOOK_URL:
         return
@@ -170,20 +215,24 @@ def discord_notify(message, dedupe_key=None):
         if dedupe_key in discord_seen:
             return
 
-        discord_seen.add(dedupe_key)
+        discord_seen.add(
+            dedupe_key
+        )
 
     try:
 
         response = requests.post(
             DISCORD_WEBHOOK_URL,
-            json={"content": message},
+            json={
+                "content": message
+            },
             timeout=10,
         )
 
         if not response.ok:
 
             logging.warning(
-                "Discord alert failed: %s %s",
+                "Discord failed: %s %s",
                 response.status_code,
                 response.text[:200],
             )
@@ -192,15 +241,19 @@ def discord_notify(message, dedupe_key=None):
 
             with lock:
 
-                STATE["last_discord_alert"] = {
-                    "time": datetime.now(NY).isoformat(),
+                STATE[
+                    "last_discord_alert"
+                ] = {
+                    "time": datetime.now(
+                        NY
+                    ).isoformat(),
                     "message": message,
                 }
 
     except Exception as error:
 
         logging.warning(
-            "Discord alert error: %s",
+            "Discord error: %s",
             error,
         )
 
@@ -218,7 +271,8 @@ def log_error(error):
     with lock:
 
         STATE["errors"] = (
-            STATE["errors"] + [msg]
+            STATE["errors"]
+            + [msg]
         )[-20:]
 
 
@@ -259,6 +313,42 @@ def req(
 
 
 # ============================================================
+# RESET MEMORY EACH NEW TRADING DAY
+# ============================================================
+
+def reset_daily_memory():
+
+    global MEMORY_DATE
+    global LAST_SCANNER_ID
+
+    today = datetime.now(
+        NY
+    ).date().isoformat()
+
+    if MEMORY_DATE is None:
+
+        MEMORY_DATE = today
+        return
+
+    if MEMORY_DATE == today:
+        return
+
+    logging.info(
+        "NEW TRADING DAY | clearing breakout memory"
+    )
+
+    WATCH_MEMORY.clear()
+
+    seen_ai_bars.clear()
+
+    discord_seen.clear()
+
+    LAST_SCANNER_ID = None
+
+    MEMORY_DATE = today
+
+
+# ============================================================
 # SCANNER
 # ============================================================
 
@@ -295,12 +385,21 @@ def load_scanner():
             signature.append(
                 (
                     str(
-                        item.get("symbol", "")
+                        item.get(
+                            "symbol",
+                            "",
+                        )
                     ).upper(),
+
                     str(
-                        item.get("direction", "")
+                        item.get(
+                            "direction",
+                            "",
+                        )
                     ).upper(),
+
                     item.get("score"),
+
                     item.get("trigger"),
                 )
             )
@@ -317,15 +416,24 @@ def load_scanner():
         try:
 
             symbol = str(
-                item.get("symbol", "")
+                item.get(
+                    "symbol",
+                    "",
+                )
             ).upper().strip()
 
             direction = str(
-                item.get("direction", "")
+                item.get(
+                    "direction",
+                    "",
+                )
             ).upper().strip()
 
             score = float(
-                item.get("score", 0)
+                item.get(
+                    "score",
+                    0,
+                )
             )
 
             if not symbol:
@@ -340,13 +448,25 @@ def load_scanner():
             if score < MIN_SETUP_SCORE:
                 continue
 
-            candidate = dict(item)
+            candidate = dict(
+                item
+            )
 
-            candidate["symbol"] = symbol
-            candidate["direction"] = direction
-            candidate["score"] = score
+            candidate[
+                "symbol"
+            ] = symbol
 
-            qualified.append(candidate)
+            candidate[
+                "direction"
+            ] = direction
+
+            candidate[
+                "score"
+            ] = score
+
+            qualified.append(
+                candidate
+            )
 
         except Exception as error:
 
@@ -356,18 +476,34 @@ def load_scanner():
             )
 
     return {
-        "scanner_id": str(scanner_id),
-        "last_scan": (
-            payload.get("last_scan")
-            or payload.get("scanned_at")
-            or payload.get("scan_time")
+        "scanner_id": str(
+            scanner_id
         ),
+
+        "last_scan": (
+            payload.get(
+                "last_scan"
+            )
+            or
+            payload.get(
+                "scanned_at"
+            )
+            or
+            payload.get(
+                "scan_time"
+            )
+        ),
+
         "qualified": qualified,
     }
 
 
 # ============================================================
 # SCANNER MEMORY
+#
+# IMPORTANT:
+# Once scanner finds a setup, KEEP IT FOR THE DAY.
+# Scanner disappearing later DOES NOT remove it.
 # ============================================================
 
 def sync_scanner_memory():
@@ -376,12 +512,21 @@ def sync_scanner_memory():
 
     result = load_scanner()
 
-    scanner_id = result["scanner_id"]
-    candidates = result["qualified"]
+    scanner_id = result[
+        "scanner_id"
+    ]
+
+    candidates = result[
+        "qualified"
+    ]
 
     scanner_last_scan = result.get(
         "last_scan"
     )
+
+    now = datetime.now(
+        NY
+    ).isoformat()
 
     if scanner_id == LAST_SCANNER_ID:
 
@@ -391,121 +536,189 @@ def sync_scanner_memory():
 
     LAST_SCANNER_ID = scanner_id
 
-    now = datetime.now(NY).isoformat()
-
-    current_keys = set()
-    removed = []
-
     for item in candidates:
 
-        symbol = item["symbol"]
-        direction = item["direction"]
+        symbol = item[
+            "symbol"
+        ]
+
+        direction = item[
+            "direction"
+        ]
 
         score = float(
-            item.get("score", 0)
+            item.get(
+                "score",
+                0,
+            )
         )
 
-        key = (
-            symbol,
-            direction,
+        old = WATCH_MEMORY.get(
+            symbol
         )
 
-        current_keys.add(key)
+        # ================================================
+        # NEW SYMBOL
+        # ================================================
 
-        old = WATCH_MEMORY.get(symbol)
+        if old is None:
 
-        if (
-            old is None
-            or old.get("direction") != direction
-        ):
-
-            WATCH_MEMORY[symbol] = {
+            WATCH_MEMORY[
+                symbol
+            ] = {
                 **item,
-                "status": "WATCHING",
-                "first_seen": now,
-                "last_seen": now,
-                "scanner_scan": scanner_last_scan,
-                "confirmation_bar": None,
-                "ai_checked": False,
-                "entered": False,
+
+                "status":
+                    "WATCHING_BREAKOUT",
+
+                "first_seen":
+                    now,
+
+                "last_seen":
+                    now,
+
+                "scanner_scan":
+                    scanner_last_scan,
+
+                "confirmation_bar":
+                    None,
+
+                "ai_checked":
+                    False,
+
+                "entered":
+                    False,
             }
 
             logging.info(
-                "SCANNER ADD | %s %s | score %.2f",
+                "BREAKOUT WATCH ADD | %s %s | score %.2f | trigger %s",
                 symbol,
                 direction,
                 score,
+                item.get(
+                    "trigger"
+                ),
             )
 
-            # IMPORTANT:
-            # NO DISCORD MESSAGE HERE.
-            # Scanner/watchlist additions stay silent.
+            continue
 
-        else:
+        # ================================================
+        # SAME DIRECTION
+        # KEEP ORIGINAL BREAKOUT LEVEL
+        # ================================================
 
-            previous_status = old.get(
-                "status",
-                "WATCHING",
+        if (
+            old.get(
+                "direction"
             )
+            ==
+            direction
+        ):
 
-            old.update(item)
+            old[
+                "last_seen"
+            ] = now
 
-            old["last_seen"] = now
+            old[
+                "scanner_scan"
+            ] = scanner_last_scan
 
-            old["scanner_scan"] = (
-                scanner_last_scan
-            )
+            # Update score if newer score is higher.
 
-            if previous_status != "ENTERED":
+            try:
 
-                old["status"] = (
-                    previous_status
-                )
+                if (
+                    score
+                    >
+                    float(
+                        old.get(
+                            "score",
+                            0,
+                        )
+                    )
+                ):
 
-    for symbol in list(
-        WATCH_MEMORY.keys()
-    ):
+                    old[
+                        "score"
+                    ] = score
 
-        item = WATCH_MEMORY[symbol]
+            except Exception:
+                pass
 
-        key = (
+            continue
+
+        # ================================================
+        # DIRECTION CHANGED
+        #
+        # Replace ONLY if old setup has NOT broken out.
+        # ================================================
+
+        if old.get(
+            "status"
+        ) in (
+            "BREAKOUT_CONFIRMED",
+            "AI_REVIEW",
+            "ENTRY_APPROVED",
+            "APPROVED_NO_AUTOTRADE",
+            "ENTERED",
+        ):
+
+            continue
+
+        logging.info(
+            "DIRECTION CHANGE | %s | %s -> %s",
             symbol,
-            item.get("direction"),
+            old.get(
+                "direction"
+            ),
+            direction,
         )
 
-        if key not in current_keys:
+        WATCH_MEMORY[
+            symbol
+        ] = {
+            **item,
 
-            if item.get("status") == "ENTERED":
-                continue
+            "status":
+                "WATCHING_BREAKOUT",
 
-            removed_item = dict(item)
+            "first_seen":
+                now,
 
-            removed_item["status"] = "REMOVED"
-            removed_item["removed_at"] = now
+            "last_seen":
+                now,
 
-            removed.append(removed_item)
+            "scanner_scan":
+                scanner_last_scan,
 
-            WATCH_MEMORY.pop(
-                symbol,
+            "confirmation_bar":
                 None,
-            )
 
-            logging.info(
-                "SCANNER REMOVE | %s",
-                symbol,
-            )
+            "ai_checked":
+                False,
+
+            "entered":
+                False,
+        }
+
+    # ====================================================
+    # DO NOT REMOVE SYMBOLS HERE
+    #
+    # If scanner returns an empty list on its next cycle,
+    # existing symbols remain in WATCH_MEMORY.
+    # ====================================================
 
     with lock:
 
-        STATE["scanner_last_scan"] = (
-            scanner_last_scan
-        )
+        STATE[
+            "scanner_last_scan"
+        ] = scanner_last_scan
 
-        STATE["scanner_candidates"] = len(
+        STATE[
+            "scanner_candidates"
+        ] = len(
             candidates
         )
-
-        STATE["removed"] = removed[-20:]
 
     return list(
         WATCH_MEMORY.values()
@@ -516,23 +729,44 @@ def sync_scanner_memory():
 # STOCK BARS
 # ============================================================
 
-def get_bars(symbol, hours=12):
+def get_bars(
+    symbol,
+    hours=12,
+):
 
-    now = datetime.now(UTC)
+    now = datetime.now(
+        UTC
+    )
 
     start = (
         now
-        - timedelta(hours=hours)
+        -
+        timedelta(
+            hours=hours
+        )
     )
 
     params = {
-        "timeframe": TIMEFRAME,
-        "start": start.isoformat(),
-        "end": now.isoformat(),
-        "adjustment": "raw",
-        "feed": DATA_FEED,
-        "sort": "asc",
-        "limit": 1000,
+        "timeframe":
+            TIMEFRAME,
+
+        "start":
+            start.isoformat(),
+
+        "end":
+            now.isoformat(),
+
+        "adjustment":
+            "raw",
+
+        "feed":
+            DATA_FEED,
+
+        "sort":
+            "asc",
+
+        "limit":
+            1000,
     }
 
     result = req(
@@ -542,33 +776,61 @@ def get_bars(symbol, hours=12):
         params=params,
     )
 
-    bars = result.get("bars") or []
+    bars = (
+        result.get(
+            "bars"
+        )
+        or
+        []
+    )
 
     if not bars:
+
         return pd.DataFrame()
 
-    df = pd.DataFrame(bars)
+    df = pd.DataFrame(
+        bars
+    )
 
     df = df.rename(
         columns={
-            "t": "timestamp",
-            "o": "open",
-            "h": "high",
-            "l": "low",
-            "c": "close",
-            "v": "volume",
+            "t":
+                "timestamp",
+
+            "o":
+                "open",
+
+            "h":
+                "high",
+
+            "l":
+                "low",
+
+            "c":
+                "close",
+
+            "v":
+                "volume",
         }
     )
 
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
+    df[
+        "timestamp"
+    ] = pd.to_datetime(
+        df[
+            "timestamp"
+        ],
         utc=True,
     )
 
     df = (
         df
-        .set_index("timestamp")
-        .tz_convert(NY)
+        .set_index(
+            "timestamp"
+        )
+        .tz_convert(
+            NY
+        )
         .sort_index()
     )
 
@@ -580,20 +842,33 @@ def get_bars(symbol, hours=12):
         "volume",
     ]:
 
-        df[column] = pd.to_numeric(
-            df[column],
+        df[
+            column
+        ] = pd.to_numeric(
+            df[
+                column
+            ],
             errors="coerce",
         )
 
     df = df.dropna()
 
-    now_et = datetime.now(NY)
+    now_et = datetime.now(
+        NY
+    )
 
-    # Only use FULLY CLOSED 4-minute candles.
+    # ====================================================
+    # CLOSED 4-MINUTE CANDLES ONLY
+    # ====================================================
+
     df = df[
         df.index
-        + pd.Timedelta(minutes=4)
-        <= now_et
+        +
+        pd.Timedelta(
+            minutes=4
+        )
+        <=
+        now_et
     ]
 
     return df
@@ -607,8 +882,12 @@ def enrich(df):
 
     data = df.copy()
 
-    data["ema5"] = (
-        data["close"]
+    data[
+        "ema5"
+    ] = (
+        data[
+            "close"
+        ]
         .ewm(
             span=EMA_FAST,
             adjust=False,
@@ -616,8 +895,12 @@ def enrich(df):
         .mean()
     )
 
-    data["ema9"] = (
-        data["close"]
+    data[
+        "ema9"
+    ] = (
+        data[
+            "close"
+        ]
         .ewm(
             span=EMA_SLOW,
             adjust=False,
@@ -625,8 +908,12 @@ def enrich(df):
         .mean()
     )
 
-    data["ema30"] = (
-        data["close"]
+    data[
+        "ema30"
+    ] = (
+        data[
+            "close"
+        ]
         .ewm(
             span=EMA_TREND,
             adjust=False,
@@ -640,14 +927,26 @@ def enrich(df):
     )
 
     typical_price = (
-        data["high"]
-        + data["low"]
-        + data["close"]
+        data[
+            "high"
+        ]
+        +
+        data[
+            "low"
+        ]
+        +
+        data[
+            "close"
+        ]
     ) / 3
 
     cumulative_volume = (
-        data["volume"]
-        .groupby(dates)
+        data[
+            "volume"
+        ]
+        .groupby(
+            dates
+        )
         .cumsum()
         .replace(
             0,
@@ -655,18 +954,30 @@ def enrich(df):
         )
     )
 
-    data["vwap"] = (
+    data[
+        "vwap"
+    ] = (
         (
             typical_price
-            * data["volume"]
+            *
+            data[
+                "volume"
+            ]
         )
-        .groupby(dates)
+        .groupby(
+            dates
+        )
         .cumsum()
-        / cumulative_volume
+        /
+        cumulative_volume
     )
 
-    data["vol20"] = (
-        data["volume"]
+    data[
+        "vol20"
+    ] = (
+        data[
+            "volume"
+        ]
         .rolling(
             20,
             min_periods=5,
@@ -678,33 +989,52 @@ def enrich(df):
 
 
 # ============================================================
-# HARD CONFIRMATION
-# BREAKOUT / BREAKDOWN ONLY
+# BREAKOUT CONFIRMATION
 # ============================================================
 
-def hard_confirmation(item, df):
+def hard_confirmation(
+    item,
+    df,
+):
 
-    if len(df) < 30:
+    if len(
+        df
+    ) < 30:
+
         return None
 
-    data = enrich(df)
+    data = enrich(
+        df
+    )
 
-    last = data.iloc[-1]
-    previous = data.iloc[-2]
+    last = data.iloc[
+        -1
+    ]
+
+    previous = data.iloc[
+        -2
+    ]
 
     direction = str(
-        item.get("direction", "")
+        item.get(
+            "direction",
+            "",
+        )
     ).upper()
 
     if direction not in (
         "CALL",
         "PUT",
     ):
+
         return None
 
-    trigger_raw = item.get("trigger")
+    trigger_raw = item.get(
+        "trigger"
+    )
 
     if trigger_raw is None:
+
         return None
 
     try:
@@ -718,93 +1048,154 @@ def hard_confirmation(item, df):
         return None
 
     price = float(
-        last["close"]
+        last[
+            "close"
+        ]
     )
 
     previous_close = float(
-        previous["close"]
+        previous[
+            "close"
+        ]
     )
 
     bullish_candle = (
-        float(last["close"])
+        float(
+            last[
+                "close"
+            ]
+        )
         >
-        float(last["open"])
+        float(
+            last[
+                "open"
+            ]
+        )
     )
 
     bearish_candle = (
-        float(last["close"])
+        float(
+            last[
+                "close"
+            ]
+        )
         <
-        float(last["open"])
+        float(
+            last[
+                "open"
+            ]
+        )
     )
 
     call_structure = (
-        last["ema5"] > last["ema9"]
+        last[
+            "ema5"
+        ]
+        >
+        last[
+            "ema9"
+        ]
         and
-        last["ema9"] > last["ema30"]
+        last[
+            "ema9"
+        ]
+        >
+        last[
+            "ema30"
+        ]
         and
-        price > last["vwap"]
+        price
+        >
+        last[
+            "vwap"
+        ]
     )
 
     put_structure = (
-        last["ema5"] < last["ema9"]
+        last[
+            "ema5"
+        ]
+        <
+        last[
+            "ema9"
+        ]
         and
-        last["ema9"] < last["ema30"]
+        last[
+            "ema9"
+        ]
+        <
+        last[
+            "ema30"
+        ]
         and
-        price < last["vwap"]
+        price
+        <
+        last[
+            "vwap"
+        ]
     )
 
-    # ========================================================
-    # TRUE BREAKOUT CROSS
-    #
-    # CALL:
-    # Previous close was at/below resistance.
-    # New completed 4m candle closes above resistance.
-    #
-    # PUT:
-    # Previous close was at/above support.
-    # New completed 4m candle closes below support.
-    #
-    # A wick through the level DOES NOT count.
-    # ========================================================
+    # ====================================================
+    # TRUE BREAKOUT
+    # ====================================================
 
     if direction == "CALL":
 
         confirmed = (
-            previous_close <= trigger
+            previous_close
+            <=
+            trigger
+
             and
-            price > trigger
+
+            price
+            >
+            trigger
+
             and
+
             bullish_candle
+
             and
+
             call_structure
-        )
-
-    elif direction == "PUT":
-
-        confirmed = (
-            previous_close >= trigger
-            and
-            price < trigger
-            and
-            bearish_candle
-            and
-            put_structure
         )
 
     else:
 
-        return None
+        confirmed = (
+            previous_close
+            >=
+            trigger
+
+            and
+
+            price
+            <
+            trigger
+
+            and
+
+            bearish_candle
+
+            and
+
+            put_structure
+        )
 
     if not confirmed:
+
         return None
 
     bar_time = (
-        data.index[-1].isoformat()
+        data.index[
+            -1
+        ].isoformat()
     )
 
-    # ========================================================
-    # BREAKOUT-ONLY DISCORD ALERT
-    # ========================================================
+    # ====================================================
+    # BREAKOUT ALERT
+    # ====================================================
 
     if direction == "CALL":
 
@@ -812,17 +1203,21 @@ def hard_confirmation(item, df):
             (
                 f"🚀 **BREAKOUT CONFIRMED**\n"
                 f"**{item['symbol']} CALL**\n"
-                f"Breakout level: **${trigger:.2f}**\n"
+                f"Breakout: **${trigger:.2f}**\n"
                 f"4-Min close: **${price:.2f}**\n"
                 f"Target: **{item.get('target')}**\n"
+                f"Score: **{item.get('score')}**\n"
                 f"EMA5: {float(last['ema5']):.2f}\n"
                 f"EMA9: {float(last['ema9']):.2f}\n"
                 f"EMA30: {float(last['ema30']):.2f}\n"
                 f"VWAP: {float(last['vwap']):.2f}"
             ),
+
             dedupe_key=(
-                "breakout",
-                item["symbol"],
+                "BREAKOUT",
+                item[
+                    "symbol"
+                ],
                 direction,
                 bar_time,
             ),
@@ -834,17 +1229,21 @@ def hard_confirmation(item, df):
             (
                 f"🔻 **BREAKDOWN CONFIRMED**\n"
                 f"**{item['symbol']} PUT**\n"
-                f"Breakdown level: **${trigger:.2f}**\n"
+                f"Breakdown: **${trigger:.2f}**\n"
                 f"4-Min close: **${price:.2f}**\n"
                 f"Target: **{item.get('target')}**\n"
+                f"Score: **{item.get('score')}**\n"
                 f"EMA5: {float(last['ema5']):.2f}\n"
                 f"EMA9: {float(last['ema9']):.2f}\n"
                 f"EMA30: {float(last['ema30']):.2f}\n"
                 f"VWAP: {float(last['vwap']):.2f}"
             ),
+
             dedupe_key=(
-                "breakout",
-                item["symbol"],
+                "BREAKDOWN",
+                item[
+                    "symbol"
+                ],
                 direction,
                 bar_time,
             ),
@@ -856,40 +1255,78 @@ def hard_confirmation(item, df):
         6
     ).iterrows():
 
-        candles.append(
-            {
-                "time": timestamp.isoformat(),
-                "o": round(
-                    float(row["open"]),
+        candles.append({
+            "time":
+                timestamp.isoformat(),
+
+            "o":
+                round(
+                    float(
+                        row[
+                            "open"
+                        ]
+                    ),
                     4,
                 ),
-                "h": round(
-                    float(row["high"]),
+
+            "h":
+                round(
+                    float(
+                        row[
+                            "high"
+                        ]
+                    ),
                     4,
                 ),
-                "l": round(
-                    float(row["low"]),
+
+            "l":
+                round(
+                    float(
+                        row[
+                            "low"
+                        ]
+                    ),
                     4,
                 ),
-                "c": round(
-                    float(row["close"]),
+
+            "c":
+                round(
+                    float(
+                        row[
+                            "close"
+                        ]
+                    ),
                     4,
                 ),
-                "v": int(
-                    row["volume"]
+
+            "v":
+                int(
+                    row[
+                        "volume"
+                    ]
                 ),
-            }
-        )
+        })
 
     if (
-        pd.notna(last["vol20"])
-        and last["vol20"]
+        pd.notna(
+            last[
+                "vol20"
+            ]
+        )
+        and
+        last[
+            "vol20"
+        ]
     ):
 
         volume_ratio = (
-            last["volume"]
+            last[
+                "volume"
+            ]
             /
-            last["vol20"]
+            last[
+                "vol20"
+            ]
         )
 
     else:
@@ -897,44 +1334,107 @@ def hard_confirmation(item, df):
         volume_ratio = 1.0
 
     return {
-        "symbol": item["symbol"],
-        "direction": direction,
-        "scanner_score": item.get("score"),
-        "scanner_status": item.get("status"),
-        "trigger": trigger,
-        "support": item.get("support"),
-        "resistance": item.get("resistance"),
-        "scanner_target": item.get("target"),
-        "price": round(
-            price,
-            4,
-        ),
-        "ema5": round(
-            float(last["ema5"]),
-            4,
-        ),
-        "ema9": round(
-            float(last["ema9"]),
-            4,
-        ),
-        "ema30": round(
-            float(last["ema30"]),
-            4,
-        ),
-        "vwap": round(
-            float(last["vwap"]),
-            4,
-        ),
-        "volume_ratio": round(
-            float(volume_ratio),
-            2,
-        ),
-        "bar_time": bar_time,
-        "previous_close": round(
-            previous_close,
-            4,
-        ),
-        "recent_candles": candles,
+        "symbol":
+            item[
+                "symbol"
+            ],
+
+        "direction":
+            direction,
+
+        "scanner_score":
+            item.get(
+                "score"
+            ),
+
+        "scanner_status":
+            item.get(
+                "status"
+            ),
+
+        "trigger":
+            trigger,
+
+        "support":
+            item.get(
+                "support"
+            ),
+
+        "resistance":
+            item.get(
+                "resistance"
+            ),
+
+        "scanner_target":
+            item.get(
+                "target"
+            ),
+
+        "price":
+            round(
+                price,
+                4,
+            ),
+
+        "ema5":
+            round(
+                float(
+                    last[
+                        "ema5"
+                    ]
+                ),
+                4,
+            ),
+
+        "ema9":
+            round(
+                float(
+                    last[
+                        "ema9"
+                    ]
+                ),
+                4,
+            ),
+
+        "ema30":
+            round(
+                float(
+                    last[
+                        "ema30"
+                    ]
+                ),
+                4,
+            ),
+
+        "vwap":
+            round(
+                float(
+                    last[
+                        "vwap"
+                    ]
+                ),
+                4,
+            ),
+
+        "volume_ratio":
+            round(
+                float(
+                    volume_ratio
+                ),
+                2,
+            ),
+
+        "bar_time":
+            bar_time,
+
+        "previous_close":
+            round(
+                previous_close,
+                4,
+            ),
+
+        "recent_candles":
+            candles,
     }
 
 
@@ -953,12 +1453,15 @@ def positions():
         result,
         list,
     ):
+
         return result
 
     return []
 
 
-def underlying_open(symbol):
+def underlying_open(
+    symbol
+):
 
     for position in positions():
 
@@ -972,6 +1475,7 @@ def underlying_open(symbol):
         if position_symbol.startswith(
             symbol
         ):
+
             return True
 
     return False
@@ -988,7 +1492,9 @@ def option_contract(
 ):
 
     today = (
-        datetime.now(NY)
+        datetime.now(
+            NY
+        )
         .date()
         .isoformat()
     )
@@ -996,15 +1502,25 @@ def option_contract(
     option_type = (
         "call"
         if direction == "CALL"
-        else "put"
+        else
+        "put"
     )
 
     params = {
-        "underlying_symbols": symbol,
-        "status": "active",
-        "type": option_type,
-        "expiration_date": today,
-        "limit": 1000,
+        "underlying_symbols":
+            symbol,
+
+        "status":
+            "active",
+
+        "type":
+            option_type,
+
+        "expiration_date":
+            today,
+
+        "limit":
+            1000,
     }
 
     data = req(
@@ -1014,15 +1530,24 @@ def option_contract(
     )
 
     contracts = (
-        data.get("option_contracts")
-        or data.get("contracts")
-        or []
+        data.get(
+            "option_contracts"
+        )
+        or
+        data.get(
+            "contracts"
+        )
+        or
+        []
     )
 
     if not contracts:
+
         return None
 
-    def strike(contract):
+    def strike(
+        contract
+    ):
 
         try:
 
@@ -1030,7 +1555,8 @@ def option_contract(
                 contract.get(
                     "strike_price"
                 )
-                or 0
+                or
+                0
             )
 
         except Exception:
@@ -1039,25 +1565,33 @@ def option_contract(
 
     contracts = [
         contract
-        for contract in contracts
-        if strike(contract) > 0
+        for contract
+        in contracts
+        if strike(
+            contract
+        ) > 0
     ]
 
     if not contracts:
+
         return None
 
     return min(
         contracts,
+
         key=lambda contract:
         abs(
-            strike(contract)
-            - price
+            strike(
+                contract
+            )
+            -
+            price
         ),
     )
 
 
 # ============================================================
-# SUBMIT ORDER
+# SUBMIT OPTION
 # ============================================================
 
 def submit_option(
@@ -1076,13 +1610,17 @@ def submit_option(
     if not contract:
 
         raise RuntimeError(
-            f"No same-day {direction} "
-            f"option contract for {symbol}"
+            f"No same-day {direction} option contract for {symbol}"
         )
 
     option_symbol = (
-        contract.get("symbol")
-        or contract.get("id")
+        contract.get(
+            "symbol"
+        )
+        or
+        contract.get(
+            "id"
+        )
     )
 
     if not option_symbol:
@@ -1094,46 +1632,86 @@ def submit_option(
     order = req(
         "POST",
         "/v2/orders",
+
         data={
-            "symbol": option_symbol,
-            "qty": str(
-                max(
-                    1,
-                    OPTION_QTY,
-                )
-            ),
-            "side": "buy",
-            "type": "market",
-            "time_in_force": "day",
+            "symbol":
+                option_symbol,
+
+            "qty":
+                str(
+                    max(
+                        1,
+                        OPTION_QTY,
+                    )
+                ),
+
+            "side":
+                "buy",
+
+            "type":
+                "market",
+
+            "time_in_force":
+                "day",
         },
     )
 
-    managed[option_symbol] = {
-        "underlying": symbol,
-        "direction": direction,
-        "trigger": (
-            decision.get("entry")
-            or price
-        ),
-        "stop": decision.get("stop"),
-        "tp1": decision.get("tp1"),
-        "tp2": decision.get("tp2"),
-        "tp1_done": False,
+    managed[
+        option_symbol
+    ] = {
+        "underlying":
+            symbol,
+
+        "direction":
+            direction,
+
+        "trigger":
+            (
+                decision.get(
+                    "entry"
+                )
+                or
+                price
+            ),
+
+        "stop":
+            decision.get(
+                "stop"
+            ),
+
+        "tp1":
+            decision.get(
+                "tp1"
+            ),
+
+        "tp2":
+            decision.get(
+                "tp2"
+            ),
+
+        "tp1_done":
+            False,
     }
 
     if symbol in WATCH_MEMORY:
 
-        WATCH_MEMORY[symbol][
+        WATCH_MEMORY[
+            symbol
+        ][
             "status"
         ] = "ENTERED"
 
-        WATCH_MEMORY[symbol][
+        WATCH_MEMORY[
+            symbol
+        ][
             "entered_at"
         ] = datetime.now(
             NY
         ).isoformat()
 
-        WATCH_MEMORY[symbol][
+        WATCH_MEMORY[
+            symbol
+        ][
             "option_symbol"
         ] = option_symbol
 
@@ -1144,8 +1722,8 @@ def submit_option(
         option_symbol,
     )
 
-    # NO DISCORD MESSAGE.
-    # Breakout alerts only.
+    # No Discord alert.
+    # Discord is breakout only.
 
     return order
 
@@ -1169,12 +1747,24 @@ def close_option(
     return req(
         "POST",
         "/v2/orders",
+
         data={
-            "symbol": option_symbol,
-            "qty": str(qty),
-            "side": "sell",
-            "type": "market",
-            "time_in_force": "day",
+            "symbol":
+                option_symbol,
+
+            "qty":
+                str(
+                    qty
+                ),
+
+            "side":
+                "sell",
+
+            "type":
+                "market",
+
+            "time_in_force":
+                "day",
         },
     )
 
@@ -1183,7 +1773,9 @@ def close_option(
 # LATEST STOCK PRICE
 # ============================================================
 
-def latest_stock_price(symbol):
+def latest_stock_price(
+    symbol
+):
 
     df = get_bars(
         symbol,
@@ -1191,20 +1783,27 @@ def latest_stock_price(symbol):
     )
 
     if df.empty:
+
         return None
 
     return float(
-        df["close"].iloc[-1]
+        df[
+            "close"
+        ].iloc[
+            -1
+        ]
     )
 
 
 # ============================================================
-# MANAGE OPEN POSITIONS
+# MANAGE POSITIONS
 # ============================================================
 
 def manage_positions():
 
-    now = datetime.now(NY)
+    now = datetime.now(
+        NY
+    )
 
     current_positions = positions()
 
@@ -1217,11 +1816,17 @@ def manage_positions():
             position = next(
                 (
                     position
+
                     for position
                     in current_positions
-                    if position.get("symbol")
-                    == option_symbol
+
+                    if position.get(
+                        "symbol"
+                    )
+                    ==
+                    option_symbol
                 ),
+
                 None,
             )
 
@@ -1234,7 +1839,6 @@ def manage_positions():
 
                 continue
 
-            # FORCE EXIT
             if now.time() >= FORCE_EXIT:
 
                 close_option(
@@ -1242,8 +1846,7 @@ def manage_positions():
                 )
 
                 logging.info(
-                    "FORCE EXIT | %s | %s",
-                    info["underlying"],
+                    "FORCE EXIT | %s",
                     option_symbol,
                 )
 
@@ -1255,18 +1858,25 @@ def manage_positions():
                 continue
 
             price = latest_stock_price(
-                info["underlying"]
+                info[
+                    "underlying"
+                ]
             )
 
             if price is None:
+
                 continue
 
             qty = max(
                 1,
+
                 int(
                     float(
-                        position.get("qty")
-                        or 1
+                        position.get(
+                            "qty"
+                        )
+                        or
+                        1
                     )
                 ),
             )
@@ -1275,60 +1885,92 @@ def manage_positions():
                 "direction"
             ]
 
-            stop = info.get("stop")
-            tp1 = info.get("tp1")
-            tp2 = info.get("tp2")
+            stop = info.get(
+                "stop"
+            )
+
+            tp1 = info.get(
+                "tp1"
+            )
+
+            tp2 = info.get(
+                "tp2"
+            )
 
             stop_hit = (
                 stop is not None
+
                 and
+
                 (
                     (
                         direction == "CALL"
                         and
-                        price <= float(stop)
+                        price <= float(
+                            stop
+                        )
                     )
+
                     or
+
                     (
                         direction == "PUT"
                         and
-                        price >= float(stop)
+                        price >= float(
+                            stop
+                        )
                     )
                 )
             )
 
             tp1_hit = (
                 tp1 is not None
+
                 and
+
                 (
                     (
                         direction == "CALL"
                         and
-                        price >= float(tp1)
+                        price >= float(
+                            tp1
+                        )
                     )
+
                     or
+
                     (
                         direction == "PUT"
                         and
-                        price <= float(tp1)
+                        price <= float(
+                            tp1
+                        )
                     )
                 )
             )
 
             tp2_hit = (
                 tp2 is not None
+
                 and
+
                 (
                     (
                         direction == "CALL"
                         and
-                        price >= float(tp2)
+                        price >= float(
+                            tp2
+                        )
                     )
+
                     or
+
                     (
                         direction == "PUT"
                         and
-                        price <= float(tp2)
+                        price <= float(
+                            tp2
+                        )
                     )
                 )
             )
@@ -1341,7 +1983,9 @@ def manage_positions():
 
                 logging.info(
                     "STOP HIT | %s %s | %.2f",
-                    info["underlying"],
+                    info[
+                        "underlying"
+                    ],
                     direction,
                     price,
                 )
@@ -1359,7 +2003,9 @@ def manage_positions():
 
                 logging.info(
                     "TP2 HIT | %s %s | %.2f",
-                    info["underlying"],
+                    info[
+                        "underlying"
+                    ],
                     direction,
                     price,
                 )
@@ -1372,7 +2018,9 @@ def manage_positions():
             elif (
                 tp1_hit
                 and
-                not info["tp1_done"]
+                not info[
+                    "tp1_done"
+                ]
             ):
 
                 if qty > 1:
@@ -1391,11 +2039,15 @@ def manage_positions():
                     sell_qty,
                 )
 
-                info["tp1_done"] = True
+                info[
+                    "tp1_done"
+                ] = True
 
                 logging.info(
                     "TP1 HIT | %s %s | %.2f",
-                    info["underlying"],
+                    info[
+                        "underlying"
+                    ],
                     direction,
                     price,
                 )
@@ -1410,22 +2062,19 @@ def manage_positions():
         except Exception as error:
 
             log_error(
-                f"manage {option_symbol}: "
-                f"{error}"
+                f"manage {option_symbol}: {error}"
             )
 
 
 # ============================================================
-# CLEAN DAILY COUNTS
+# DAILY COUNTS
 # ============================================================
 
 def clean_daily_counts():
 
-    today = (
-        datetime.now(NY)
-        .date()
-        .isoformat()
-    )
+    today = datetime.now(
+        NY
+    ).date().isoformat()
 
     for key in list(
         daily_trade_counts.keys()
@@ -1447,7 +2096,11 @@ def clean_daily_counts():
 
 def cycle():
 
-    now = datetime.now(NY)
+    now = datetime.now(
+        NY
+    )
+
+    reset_daily_memory()
 
     clean_daily_counts()
 
@@ -1457,40 +2110,52 @@ def cycle():
 
     with lock:
 
-        STATE["watching_count"] = len(
+        STATE[
+            "watching_count"
+        ] = len(
             watch
         )
 
-        STATE["watching"] = list(
+        STATE[
+            "watching"
+        ] = list(
             WATCH_MEMORY.values()
         )
 
-    # ========================================================
+    # ====================================================
     # PREMARKET
-    # ========================================================
+    # Scanner can populate memory.
+    # Breakout trading starts at 9:30.
+    # ====================================================
 
     if now.time() < RTH_START:
 
         with lock:
 
             STATE.update(
-                status="PREMARKET_WATCHING",
-                last_cycle=now.isoformat(),
+                status=
+                    "PREMARKET_WATCHING",
+
+                last_cycle=
+                    now.isoformat(),
             )
 
         return
 
-    # ========================================================
-    # NO NEW ENTRIES AFTER CUTOFF
-    # ========================================================
+    # ====================================================
+    # NO NEW TRADES AFTER 2:45
+    # ====================================================
 
     if now.time() >= LAST_ENTRY:
 
         with lock:
 
             STATE.update(
-                status="NO_NEW_ENTRIES",
-                last_cycle=now.isoformat(),
+                status=
+                    "NO_NEW_ENTRIES",
+
+                last_cycle=
+                    now.isoformat(),
             )
 
         return
@@ -1499,9 +2164,15 @@ def cycle():
 
     watch = sorted(
         watch,
-        key=lambda x: float(
-            x.get("score", 0)
+
+        key=lambda x:
+        float(
+            x.get(
+                "score",
+                0,
+            )
         ),
+
         reverse=True,
     )
 
@@ -1509,19 +2180,28 @@ def cycle():
 
         if (
             new_trades
-            >= MAX_NEW_TRADES_PER_CYCLE
+            >=
+            MAX_NEW_TRADES_PER_CYCLE
         ):
+
             break
 
         symbol = str(
-            item.get("symbol", "")
+            item.get(
+                "symbol",
+                "",
+            )
         ).upper()
 
         direction = str(
-            item.get("direction", "")
+            item.get(
+                "direction",
+                "",
+            )
         ).upper()
 
         if not symbol:
+
             continue
 
         memory = WATCH_MEMORY.get(
@@ -1529,20 +2209,25 @@ def cycle():
         )
 
         if not memory:
+
             continue
 
-        if (
-            memory.get("status")
-            == "ENTERED"
-        ):
+        if memory.get(
+            "status"
+        ) == "ENTERED":
+
             continue
 
         current_positions = positions()
 
         if (
-            len(current_positions)
-            >= MAX_OPEN_POSITIONS
+            len(
+                current_positions
+            )
+            >=
+            MAX_OPEN_POSITIONS
         ):
+
             break
 
         keyday = (
@@ -1555,28 +2240,35 @@ def cycle():
                 keyday,
                 0,
             )
-            >= MAX_TRADES_PER_SYMBOL_DAY
+            >=
+            MAX_TRADES_PER_SYMBOL_DAY
         ):
 
-            memory["status"] = (
-                "DAILY_LIMIT"
-            )
+            memory[
+                "status"
+            ] = "DAILY_LIMIT"
 
             continue
 
-        if underlying_open(symbol):
+        if underlying_open(
+            symbol
+        ):
 
-            memory["status"] = "ENTERED"
+            memory[
+                "status"
+            ] = "ENTERED"
 
             continue
 
-        memory["status"] = (
-            "WAITING_BREAKOUT"
-        )
+        memory[
+            "status"
+        ] = "WAITING_BREAKOUT"
 
         try:
 
-            df = get_bars(symbol)
+            df = get_bars(
+                symbol
+            )
 
         except Exception as error:
 
@@ -1587,9 +2279,7 @@ def cycle():
             continue
 
         # ====================================================
-        # BREAKOUT / BREAKDOWN CHECK
-        # Discord alert happens inside hard_confirmation()
-        # only if a TRUE breakout occurs.
+        # WAIT FOR TRUE 4-MIN BREAKOUT
         # ====================================================
 
         setup = hard_confirmation(
@@ -1598,30 +2288,54 @@ def cycle():
         )
 
         if not setup:
+
             continue
 
-        memory["status"] = (
-            "BREAKOUT_CONFIRMED"
+        memory[
+            "status"
+        ] = "BREAKOUT_CONFIRMED"
+
+        memory[
+            "confirmation_bar"
+        ] = setup[
+            "bar_time"
+        ]
+
+        logging.info(
+            "BREAKOUT CONFIRMED | %s %s | trigger %.2f | close %.2f",
+            symbol,
+            direction,
+            setup[
+                "trigger"
+            ],
+            setup[
+                "price"
+            ],
         )
 
-        memory["confirmation_bar"] = (
-            setup["bar_time"]
-        )
-
-        # NO SECOND DISCORD CONFIRMATION MESSAGE.
+        # ====================================================
+        # AI REVIEW
+        # ====================================================
 
         ai_key = (
             symbol,
             direction,
-            setup["bar_time"],
+            setup[
+                "bar_time"
+            ],
         )
 
         if ai_key in seen_ai_bars:
+
             continue
 
-        seen_ai_bars.add(ai_key)
+        seen_ai_bars.add(
+            ai_key
+        )
 
-        memory["status"] = "AI_REVIEW"
+        memory[
+            "status"
+        ] = "AI_REVIEW"
 
         try:
 
@@ -1631,9 +2345,9 @@ def cycle():
 
         except Exception as error:
 
-            memory["status"] = (
-                "AI_ERROR"
-            )
+            memory[
+                "status"
+            ] = "AI_ERROR"
 
             log_error(
                 f"AI {symbol}: {error}"
@@ -1641,37 +2355,54 @@ def cycle():
 
             continue
 
-        memory["ai_checked"] = True
-        memory["ai_decision"] = decision
-        memory["ai_checked_at"] = (
-            now.isoformat()
-        )
+        memory[
+            "ai_checked"
+        ] = True
+
+        memory[
+            "ai_decision"
+        ] = decision
+
+        memory[
+            "ai_checked_at"
+        ] = now.isoformat()
 
         with lock:
 
             STATE[
                 "last_ai_decision"
             ] = {
-                "setup": setup,
-                "decision": decision,
-                "time": now.isoformat(),
+                "setup":
+                    setup,
+
+                "decision":
+                    decision,
+
+                "time":
+                    now.isoformat(),
             }
 
         logging.info(
-            "AI DECISION | %s %s | %s | confidence %.2f",
+            "AI DECISION | %s %s | %s | %.1f%%",
             symbol,
             direction,
-            decision.get("decision"),
+            decision.get(
+                "decision"
+            ),
             float(
                 decision.get(
                     "confidence",
                     0,
                 )
-            ),
+            )
+            *
+            100,
         )
 
-        # NO AI DECISION DISCORD MESSAGE.
-        # Breakout alerts only.
+        # ====================================================
+        # AI REJECTED
+        # Keep watching for future breakout.
+        # ====================================================
 
         if (
             str(
@@ -1680,58 +2411,66 @@ def cycle():
                     "",
                 )
             ).upper()
-            != "ENTER"
+            !=
+            "ENTER"
         ):
 
-            memory["status"] = (
-                "WAITING_BREAKOUT"
-            )
+            memory[
+                "status"
+            ] = "WAITING_BREAKOUT"
 
             continue
 
-        memory["status"] = (
-            "ENTRY_APPROVED"
-        )
+        memory[
+            "status"
+        ] = "ENTRY_APPROVED"
+
+        # ====================================================
+        # AUTOTRADE OFF
+        # ====================================================
 
         if not AUTO_TRADE:
 
-            memory["status"] = (
-                "APPROVED_NO_AUTOTRADE"
-            )
+            memory[
+                "status"
+            ] = "APPROVED_NO_AUTOTRADE"
 
             logging.info(
-                "ENTRY APPROVED BUT AUTO_TRADE=false | %s %s",
+                "ENTRY APPROVED | AUTO_TRADE=false | %s %s",
                 symbol,
                 direction,
             )
 
-            # NO DISCORD MESSAGE.
-
             continue
 
         if symbol not in WATCH_MEMORY:
+
             continue
+
+        # ====================================================
+        # PLACE ORDER
+        # ====================================================
 
         try:
 
             order = submit_option(
                 symbol,
                 direction,
-                setup["price"],
+                setup[
+                    "price"
+                ],
                 decision,
             )
 
         except Exception as error:
 
-            memory["status"] = (
-                "ORDER_ERROR"
-            )
+            memory[
+                "status"
+            ] = "ORDER_ERROR"
 
             log_error(
                 f"order {symbol}: {error}"
             )
-
-            # NO DISCORD MESSAGE.
 
             continue
 
@@ -1742,28 +2481,40 @@ def cycle():
                 keyday,
                 0,
             )
-            + 1
+            +
+            1
         )
 
         new_trades += 1
 
-        memory["status"] = "ENTERED"
+        memory[
+            "status"
+        ] = "ENTERED"
 
         with lock:
 
-            STATE["last_order"] = order
+            STATE[
+                "last_order"
+            ] = order
 
     with lock:
 
         STATE.update(
-            status="RUNNING",
-            last_cycle=now.isoformat(),
-            watching_count=len(
-                WATCH_MEMORY
-            ),
-            watching=list(
-                WATCH_MEMORY.values()
-            ),
+            status=
+                "RUNNING",
+
+            last_cycle=
+                now.isoformat(),
+
+            watching_count=
+                len(
+                    WATCH_MEMORY
+                ),
+
+            watching=
+                list(
+                    WATCH_MEMORY.values()
+                ),
         )
 
 
@@ -1777,14 +2528,13 @@ def loop():
 
         try:
 
-            # NO STARTUP DISCORD ALERT.
-            # Discord is breakout/breakdown only.
-
             cycle()
 
         except Exception as error:
 
-            log_error(error)
+            log_error(
+                error
+            )
 
         time.sleep(
             LOOP_SECONDS
@@ -1808,77 +2558,95 @@ def home():
 @app.get("/watching")
 def watching():
 
-    return jsonify(
-        {
-            "count": len(
+    return jsonify({
+        "count":
+            len(
                 WATCH_MEMORY
             ),
-            "scanner_last_scan": (
-                STATE.get(
-                    "scanner_last_scan"
-                )
+
+        "scanner_last_scan":
+            STATE.get(
+                "scanner_last_scan"
             ),
-            "watching": list(
+
+        "watching":
+            list(
                 WATCH_MEMORY.values()
             ),
-        }
-    )
+    })
 
 
 @app.get("/memory")
 def memory():
 
-    return jsonify(
-        {
-            "scanner_id": (
-                LAST_SCANNER_ID
-            ),
-            "count": len(
+    return jsonify({
+        "scanner_id":
+            LAST_SCANNER_ID,
+
+        "count":
+            len(
                 WATCH_MEMORY
             ),
-            "symbols": WATCH_MEMORY,
-        }
-    )
+
+        "symbols":
+            WATCH_MEMORY,
+    })
 
 
 @app.get("/health")
 def health():
 
-    return jsonify(
-        {
-            "ok": True,
-            "status": STATE["status"],
-            "auto_trade": AUTO_TRADE,
-            "discord_enabled": bool(
+    return jsonify({
+        "ok":
+            True,
+
+        "status":
+            STATE[
+                "status"
+            ],
+
+        "auto_trade":
+            AUTO_TRADE,
+
+        "discord_enabled":
+            bool(
                 DISCORD_WEBHOOK_URL
             ),
-            "discord_mode": (
-                "BREAKOUTS_ONLY"
-            ),
-            "last_cycle": STATE[
+
+        "discord_mode":
+            "BREAKOUTS_ONLY",
+
+        "last_cycle":
+            STATE[
                 "last_cycle"
             ],
-            "scanner_last_scan": (
-                STATE.get(
-                    "scanner_last_scan"
-                )
+
+        "scanner_last_scan":
+            STATE.get(
+                "scanner_last_scan"
             ),
-            "watching_count": len(
+
+        "watching_count":
+            len(
                 WATCH_MEMORY
             ),
-            "market_entry_start": (
-                "09:30 ET"
-            ),
-            "last_entry": "14:45 ET",
-            "force_exit": "15:15 ET",
-            "paper_trading": True,
-        }
-    )
+
+        "market_entry_start":
+            "09:30 ET",
+
+        "last_entry":
+            "14:45 ET",
+
+        "force_exit":
+            "15:15 ET",
+
+        "paper_trading":
+            True,
+    })
 
 
 # ============================================================
 # TEST DISCORD
-# MANUAL TEST ONLY
 # ============================================================
 
 @app.get("/test-discord")
@@ -1886,35 +2654,29 @@ def test_discord():
 
     if not DISCORD_WEBHOOK_URL:
 
-        return jsonify(
-            {
-                "ok": False,
-                "error": (
-                    "DISCORD_WEBHOOK_URL missing"
-                ),
-            }
-        ), 400
+        return jsonify({
+            "ok":
+                False,
 
-    # This is the only non-breakout Discord message
-    # and only happens if YOU manually visit /test-discord.
+            "error":
+                "DISCORD_WEBHOOK_URL missing",
+        }), 400
 
     discord_notify(
         (
             "🔔 **TEST ALERT**\n"
-            "Discord connection is working.\n"
-            "Automatic notifications are "
-            "BREAKOUTS ONLY."
+            "Discord connection working.\n"
+            "Automatic alerts: BREAKOUTS ONLY."
         )
     )
 
-    return jsonify(
-        {
-            "ok": True,
-            "message": (
-                "Discord test alert sent."
-            ),
-        }
-    )
+    return jsonify({
+        "ok":
+            True,
+
+        "message":
+            "Discord test sent.",
+    })
 
 
 # ============================================================
@@ -1934,13 +2696,16 @@ if __name__ == "__main__":
     start_bot()
 
     app.run(
-        host="0.0.0.0",
-        port=int(
-            os.getenv(
-                "PORT",
-                "10000",
-            )
-        ),
+        host=
+            "0.0.0.0",
+
+        port=
+            int(
+                os.getenv(
+                    "PORT",
+                    "10000",
+                )
+            ),
     )
 
 else:
